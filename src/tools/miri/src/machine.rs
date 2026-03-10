@@ -40,6 +40,10 @@ use crate::concurrency::sync::SyncObj;
 use crate::concurrency::{
     AllocDataRaceHandler, GenmcCtx, GenmcEvalContextExt as _, GlobalDataRaceHandler, weak_memory,
 };
+
+use rustc_borrowck::consumers::{PoloniusInput, RustcFacts};
+use polonius_engine::Output;
+
 use crate::*;
 
 /// First real-time signal.
@@ -371,6 +375,12 @@ impl ProvenanceExtra {
     }
 }
 
+#[derive(Clone)]
+pub struct PoloniusFacts {
+    pub input_facts: PoloniusInput,
+    pub output_facts: Output<RustcFacts>,
+}
+
 /// Extra per-allocation data
 #[derive(Debug)]
 pub struct AllocExtra<'tcx> {
@@ -656,6 +666,9 @@ pub struct MiriMachine<'tcx> {
 
     /// Whether Miri artifically introduces short reads/writes on file descriptors.
     pub short_fd_operations: bool,
+
+    /// Polonius facts and output for Hybrid Borrows.
+    pub(crate) polonius_facts: Option<FxHashMap<DefId, PoloniusFacts>>,
 }
 
 impl<'tcx> MiriMachine<'tcx> {
@@ -666,6 +679,7 @@ impl<'tcx> MiriMachine<'tcx> {
         config: &MiriConfig,
         layout_cx: LayoutCx<'tcx>,
         genmc_ctx: Option<Rc<GenmcCtx>>,
+        polonius_facts: Option<FxHashMap<DefId, PoloniusFacts>>,
     ) -> Self {
         let tcx = layout_cx.tcx();
         let user_relevant_crates = Self::get_user_relevant_crates(tcx, config);
@@ -818,6 +832,7 @@ impl<'tcx> MiriMachine<'tcx> {
             float_nondet: config.float_nondet,
             float_rounding_error: config.float_rounding_error,
             short_fd_operations: config.short_fd_operations,
+            polonius_facts,
         }
     }
 
@@ -1052,6 +1067,7 @@ impl VisitProvenance for MiriMachine<'_> {
             float_nondet: _,
             float_rounding_error: _,
             short_fd_operations: _,
+            polonius_facts: _,
         } = self;
 
         threads.visit_provenance(visit);

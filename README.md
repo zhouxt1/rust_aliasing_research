@@ -19,6 +19,11 @@ standard library, and documentation.
 [Documentation]: https://www.rust-lang.org/learn#learn-use
 [Contributing]: CONTRIBUTING.md
 
+## Purpose of this Fork
+
+This is a repo for developing the Miri implementation of the Hybrid Borrow, an alternative aliasing rule (see Stacked Borrow and Tree Borrow). This rule is the base for an aliasing sanitizer. And it uses the information from the Polonius borrow checker while aiming to find aliasing bugs. 
+
+
 ## Why Rust?
 
 - **Performance:** Fast and memory-efficient, suitable for critical services, embedded devices, and easily integrated with other languages.

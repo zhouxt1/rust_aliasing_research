@@ -21,6 +21,8 @@ extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_target;
+extern crate rustc_borrowck;
+extern crate polonius_engine;
 
 /// See docs in https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc/src/main.rs
 /// and https://github.com/rust-lang/rust/pull/146627 for why we need this.
@@ -40,6 +42,7 @@ mod log;
 
 use std::env;
 use std::num::{NonZero, NonZeroI32};
+use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -53,8 +56,10 @@ use miri::{
 use rustc_abi::ExternAbi;
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_data_structures::sync::{self, DynSync};
+use rustc_borrowck::consumers::{self, ConsumerOptions, BodyWithBorrowckFacts};
+use rustc_data_structures::fx::FxHashMap;
 use rustc_driver::Compilation;
-use rustc_hir::def_id::LOCAL_CRATE;
+use rustc_hir::def_id::{LOCAL_CRATE, LocalDefId};
 use rustc_hir::{self as hir, Node};
 use rustc_hir_analysis::check::check_function_signature;
 use rustc_interface::interface::Config;
@@ -71,8 +76,38 @@ use rustc_session::EarlyDiagCtxt;
 use rustc_session::config::{CrateType, ErrorOutputType, OptLevel, Options};
 use rustc_span::def_id::DefId;
 use rustc_target::spec::Target;
+use rustc_middle::query::Providers;
+use rustc_middle::query::queries::mir_borrowck::ProvidedValue;
 
 use crate::log::setup::{deinit_loggers, init_early_loggers, init_late_loggers};
+
+thread_local! {
+    static MIR_BODIES: RefCell<FxHashMap<LocalDefId, BodyWithBorrowckFacts<'static>>> = RefCell::new(FxHashMap::default());
+}
+
+fn mir_borrowck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'tcx> {
+    // Verify that the environment variable is visible to the compiler
+    // println!(
+    //     "mir_borrowck: POLONIUS_ALGORITHM = {:?}",
+    //     std::env::var("POLONIUS_ALGORITHM")
+    // );
+    let opts = ConsumerOptions::PoloniusInputFacts;
+    let bodies_with_facts = consumers::get_bodies_with_borrowck_facts(tcx, def_id, opts);
+    // SAFETY: The reader casts the 'static lifetime to 'tcx before using it.
+    let bodies_with_facts: FxHashMap<LocalDefId, BodyWithBorrowckFacts<'static>> =
+        unsafe { std::mem::transmute(bodies_with_facts) };
+    MIR_BODIES.with(|state| {
+        let mut map = state.borrow_mut();
+        for (def_id, body_with_facts) in bodies_with_facts {
+            map.insert(def_id, body_with_facts);
+        }
+    });
+
+    let mut providers = Providers::default();
+    rustc_borrowck::provide(&mut providers);
+    let original_mir_borrowck = providers.mir_borrowck;
+    original_mir_borrowck(tcx, def_id)
+}
 
 struct MiriCompilerCalls {
     miri_config: Option<MiriConfig>,
@@ -195,6 +230,10 @@ fn make_miri_codegen_backend(opts: &Options, target: &Target) -> Box<dyn Codegen
 impl rustc_driver::Callbacks for MiriCompilerCalls {
     fn config(&mut self, config: &mut rustc_interface::interface::Config) {
         config.make_codegen_backend = Some(Box::new(make_miri_codegen_backend));
+
+        config.override_queries = Some(|_sess, local| {
+            local.queries.mir_borrowck = mir_borrowck;
+        });
     }
 
     fn after_analysis<'tcx>(
@@ -220,6 +259,34 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
 
         // Obtain and complete the Miri configuration.
         let mut config = self.miri_config.take().expect("after_analysis must only be called once");
+
+        // If Hybrid Borrows is enabled, run Polonius analysis.
+        let polonius_facts = if matches!(config.borrow_tracker, Some(BorrowTrackerMethod::HybridBorrows)) {
+            debug!("Running Polonius analysis for Hybrid Borrows...");
+            let mut facts_map = rustc_data_structures::fx::FxHashMap::default();
+            MIR_BODIES.with(|state| {
+                let map = state.borrow();
+                for (def_id, body_with_facts) in map.iter() {
+
+                    if let Some(input_facts) = &body_with_facts.input_facts {
+                        let algorithm = polonius_engine::Algorithm::DatafrogOpt;
+                        let output = polonius_engine::Output::compute(input_facts, algorithm, true);
+
+                        facts_map.insert(def_id.to_def_id(), miri::PoloniusFacts {
+                            input_facts: *input_facts.clone(),
+                            output_facts: output,
+                        });
+                    }   
+                    // if let Some(facts) = &body_with_facts.input_facts {
+                    //     facts_map.insert(def_id.to_def_id(), facts.clone());
+                    // }
+                }                
+            });
+            Some(facts_map)
+        } else {
+            None
+        };
+
         // Add filename to `miri` arguments.
         config.args.insert(0, tcx.sess.io.input.filestem().to_string());
 
@@ -247,7 +314,7 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
         let res = if config.genmc_config.is_some() {
             assert!(self.many_seeds.is_none());
             run_genmc_mode(tcx, &config, |genmc_ctx: Rc<GenmcCtx>| {
-                miri::eval_entry(tcx, entry_def_id, entry_type, &config, Some(genmc_ctx))
+                miri::eval_entry(tcx, entry_def_id, entry_type, &config, Some(genmc_ctx), polonius_facts.clone())
             })
         } else if let Some(many_seeds) = self.many_seeds.take() {
             assert!(config.seed.is_none());
@@ -255,10 +322,10 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
                 let mut config = config.clone();
                 config.seed = Some(seed);
                 eprintln!("Trying seed: {seed}");
-                miri::eval_entry(tcx, entry_def_id, entry_type, &config, /* genmc_ctx */ None)
+                miri::eval_entry(tcx, entry_def_id, entry_type, &config, /* genmc_ctx */ None, polonius_facts.clone())
             })
         } else {
-            miri::eval_entry(tcx, entry_def_id, entry_type, &config, None)
+            miri::eval_entry(tcx, entry_def_id, entry_type, &config, None, polonius_facts)
         };
         // Process interpreter result.
         if let Err(return_code) = res {
@@ -512,6 +579,8 @@ fn main() {
                 Some(BorrowTrackerMethod::TreeBorrows(TreeBorrowsParams {
                     precise_interior_mut: true,
                 }));
+        } else if arg == "-Zmiri-hybrid-borrows" {
+            miri_config.borrow_tracker = Some(BorrowTrackerMethod::HybridBorrows);
         } else if arg == "-Zmiri-tree-borrows-no-precise-interior-mut" {
             match &mut miri_config.borrow_tracker {
                 Some(BorrowTrackerMethod::TreeBorrows(params)) => {

@@ -74,6 +74,8 @@ extern crate rustc_target;
 // shipped only as rmeta files.
 #[allow(unused_extern_crates)]
 extern crate rustc_driver;
+extern crate rustc_borrowck;
+extern crate polonius_engine;
 
 mod alloc;
 mod alloc_addresses;
@@ -148,7 +150,7 @@ pub use crate::intrinsics::EvalContextExt as _;
 pub use crate::machine::{
     AlignmentCheck, AllocExtra, BacktraceStyle, DynMachineCallback, FloatRoundingErrorMode,
     FrameExtra, IsolatedOp, MachineCallback, MemoryKind, MiriInterpCx, MiriInterpCxExt,
-    MiriMachine, MiriMemoryKind, PrimitiveLayouts, Provenance, ProvenanceExtra, RejectOpWith,
+    MiriMachine, MiriMemoryKind, PoloniusFacts, PrimitiveLayouts, Provenance, ProvenanceExtra, RejectOpWith,
     ValidationMode,
 };
 pub use crate::operator::EvalContextExt as _;

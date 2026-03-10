@@ -10,6 +10,8 @@ use smallvec::SmallVec;
 use crate::*;
 pub mod stacked_borrows;
 pub mod tree_borrows;
+pub mod hybrid_borrows;
+use self::hybrid_borrows::EvalContextExt as _;
 
 /// Indicates which kind of access is being performed.
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
@@ -218,6 +220,8 @@ pub enum BorrowTrackerMethod {
     StackedBorrows,
     /// Tree borrows, as implemented in borrow_tracker/tree_borrows
     TreeBorrows(TreeBorrowsParams),
+    /// Hybrid borrows, combining static Polonius facts with dynamic tracking    
+    HybridBorrows,
 }
 
 /// Parameters that Tree Borrows can take.
@@ -257,6 +261,10 @@ impl GlobalStateInner {
                 AllocState::TreeBorrows(Box::new(RefCell::new(Tree::new_allocation(
                     id, alloc_size, self, kind, machine,
                 )))),
+            BorrowTrackerMethod::HybridBorrows =>
+                AllocState::HybridBorrows(Box::new(RefCell::new(hybrid_borrows::AllocState::new_allocation(
+                    id, alloc_size, self, kind, machine,
+                )))),
         }
     }
 }
@@ -273,7 +281,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let method = this.machine.borrow_tracker.as_ref().unwrap().borrow().borrow_tracker_method;
         match method {
             BorrowTrackerMethod::StackedBorrows => this.sb_retag_ptr_value(kind, val),
-            BorrowTrackerMethod::TreeBorrows { .. } => this.tb_retag_ptr_value(kind, val),
+            BorrowTrackerMethod::TreeBorrows { .. } => this.tb_retag_ptr_value(kind, val),            BorrowTrackerMethod::HybridBorrows => this.hb_retag_ptr_value(kind, val),
+            BorrowTrackerMethod::HybridBorrows => this.hb_retag_ptr_value(kind, val),
         }
     }
 
@@ -288,6 +297,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         match method {
             BorrowTrackerMethod::StackedBorrows => this.sb_retag_place_contents(kind, place),
             BorrowTrackerMethod::TreeBorrows { .. } => this.tb_retag_place_contents(kind, place),
+            BorrowTrackerMethod::HybridBorrows => this.hb_retag_place_contents(kind, place),
         }
     }
 
@@ -298,6 +308,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         match method {
             BorrowTrackerMethod::StackedBorrows => this.sb_protect_place(place),
             BorrowTrackerMethod::TreeBorrows { .. } => this.tb_protect_place(place),
+            BorrowTrackerMethod::HybridBorrows => this.hb_protect_place(place),
         }
     }
 
@@ -309,6 +320,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         match method {
             BorrowTrackerMethod::StackedBorrows => this.sb_expose_tag(alloc_id, tag),
             BorrowTrackerMethod::TreeBorrows { .. } => this.tb_expose_tag(alloc_id, tag),
+            BorrowTrackerMethod::HybridBorrows => this.hb_expose_tag(alloc_id, tag),     
         }
     }
 
@@ -327,6 +339,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
             BorrowTrackerMethod::TreeBorrows { .. } =>
                 this.tb_give_pointer_debug_name(ptr, nth_parent, name),
+            BorrowTrackerMethod::HybridBorrows =>
+                this.hb_give_pointer_debug_name(ptr, nth_parent, name),
         }
     }
 
@@ -340,6 +354,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         match method {
             BorrowTrackerMethod::StackedBorrows => this.print_stacks(alloc_id),
             BorrowTrackerMethod::TreeBorrows { .. } => this.print_tree(alloc_id, show_unnamed),
+            BorrowTrackerMethod::HybridBorrows => this.hb_print_borrow_state(alloc_id, show_unnamed),
         }
     }
 
@@ -391,6 +406,8 @@ pub enum AllocState {
     StackedBorrows(Box<RefCell<stacked_borrows::AllocState>>),
     /// Data corresponding to Tree Borrows
     TreeBorrows(Box<RefCell<tree_borrows::AllocState>>),
+    /// Data corrdsponding to Hybrid Borrows
+    HybridBorrows(Box<RefCell<hybrid_borrows::AllocState>>),
 }
 
 impl machine::AllocExtra<'_> {
@@ -417,6 +434,14 @@ impl machine::AllocExtra<'_> {
             _ => panic!("expected Tree Borrows borrow tracking, got something else"),
         }
     }
+
+    #[track_caller]
+    pub fn borrow_tracker_hb(&self) -> &RefCell<hybrid_borrows::AllocState> {
+        match self.borrow_tracker {
+            Some(AllocState::HybridBorrows(ref hb)) => hb,
+            _ => panic!("expected Hybrid Borrows borrow tracking, got something else"),
+        }
+    }
 }
 
 impl AllocState {
@@ -433,6 +458,14 @@ impl AllocState {
                 sb.borrow_mut().before_memory_read(alloc_id, prov_extra, range, machine),
             AllocState::TreeBorrows(tb) =>
                 tb.borrow_mut().before_memory_access(
+                    AccessKind::Read,
+                    alloc_id,
+                    prov_extra,
+                    range,
+                    machine,
+                ),
+            AllocState::HybridBorrows(hb) =>
+                hb.borrow_mut().before_memory_access(
                     AccessKind::Read,
                     alloc_id,
                     prov_extra,
@@ -461,6 +494,14 @@ impl AllocState {
                     range,
                     machine,
                 ),
+            AllocState::HybridBorrows(hb) =>
+                hb.borrow_mut().before_memory_access(
+                    AccessKind::Write,
+                    alloc_id,
+                    prov_extra,
+                    range,
+                    machine,
+                ),
         }
     }
 
@@ -478,6 +519,9 @@ impl AllocState {
                 sb.get_mut().before_memory_deallocation(alloc_id, prov_extra, size, machine),
             AllocState::TreeBorrows(tb) =>
                 tb.get_mut().before_memory_deallocation(alloc_id, prov_extra, size, machine),
+            AllocState::HybridBorrows(hb) =>
+                hb.get_mut().before_memory_deallocation(alloc_id, prov_extra, size, machine),
+
         }
     }
 
@@ -486,6 +530,7 @@ impl AllocState {
         match self {
             AllocState::StackedBorrows(sb) => sb.borrow_mut().remove_unreachable_tags(tags),
             AllocState::TreeBorrows(tb) => tb.borrow_mut().remove_unreachable_tags(tags),
+            AllocState::HybridBorrows(hb) => hb.borrow_mut().remove_unreachable_tags(tags),
         }
     }
 
@@ -506,6 +551,8 @@ impl AllocState {
             AllocState::StackedBorrows(_sb) => interp_ok(()),
             AllocState::TreeBorrows(tb) =>
                 tb.borrow_mut().release_protector(machine, global, tag, alloc_id),
+            AllocState::HybridBorrows(hb) =>
+                hb.borrow_mut().release_protector(machine, global, tag, alloc_id),
         }
     }
 }
@@ -516,6 +563,7 @@ impl VisitProvenance for AllocState {
         match self {
             AllocState::StackedBorrows(sb) => sb.visit_provenance(visit),
             AllocState::TreeBorrows(tb) => tb.visit_provenance(visit),
+            AllocState::HybridBorrows(hb) => hb.visit_provenance(visit),
         }
     }
 }

@@ -154,6 +154,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             BackwardIncompatibleDropHint { .. } => {}
         }
 
+        M::after_statement(self)?;
+
         interp_ok(())
     }
 

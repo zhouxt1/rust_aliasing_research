@@ -278,6 +278,7 @@ pub fn create_ecx<'tcx>(
     entry_type: MiriEntryFnType,
     config: &MiriConfig,
     genmc_ctx: Option<Rc<GenmcCtx>>,
+    polonius_facts: Option<FxHashMap<DefId, crate::machine::PoloniusFacts>>,
 ) -> InterpResult<'tcx, InterpCx<'tcx, MiriMachine<'tcx>>> {
     let typing_env = ty::TypingEnv::fully_monomorphized();
     let layout_cx = LayoutCx::new(tcx, typing_env);
@@ -285,7 +286,7 @@ pub fn create_ecx<'tcx>(
         tcx,
         rustc_span::DUMMY_SP,
         typing_env,
-        MiriMachine::new(config, layout_cx, genmc_ctx),
+        MiriMachine::new(config, layout_cx, genmc_ctx, polonius_facts),
     );
 
     // Make sure we have MIR. We check MIR for some stable monomorphic function in libcore.
@@ -460,11 +461,12 @@ pub fn eval_entry<'tcx>(
     entry_type: MiriEntryFnType,
     config: &MiriConfig,
     genmc_ctx: Option<Rc<GenmcCtx>>,
+    polonius_facts: Option<FxHashMap<DefId, crate::machine::PoloniusFacts>>,
 ) -> Result<(), NonZeroI32> {
     // Copy setting before we move `config`.
     let ignore_leaks = config.ignore_leaks;
 
-    let mut ecx = match create_ecx(tcx, entry_id, entry_type, config, genmc_ctx).report_err() {
+    let mut ecx = match create_ecx(tcx, entry_id, entry_type, config, genmc_ctx, polonius_facts).report_err() {
         Ok(v) => v,
         Err(err) => {
             let (kind, backtrace) = err.into_parts();
