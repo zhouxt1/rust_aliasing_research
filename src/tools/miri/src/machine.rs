@@ -21,6 +21,7 @@ use rustc_hir::attrs::InlineAttr;
 use rustc_log::tracing;
 use rustc_middle::middle::codegen_fn_attrs::TargetFeatureKind;
 use rustc_middle::mir;
+use rustc_middle::mir::{Local, Location};
 use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::layout::{
     HasTyCtxt, HasTypingEnv, LayoutCx, LayoutError, LayoutOf, TyAndLayout,
@@ -379,6 +380,14 @@ impl ProvenanceExtra {
 pub struct PoloniusFacts {
     pub input_facts: PoloniusInput,
     pub output_facts: Output<RustcFacts>,
+    pub return_borrowers: FxHashMap<Location, ReturnBorrowers>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ReturnBorrowers {
+    pub shared: Option<Vec<Local>>,
+    pub mut_borrows: Option<Vec<Local>>,
+    pub two_phase: Option<Vec<Local>>,
 }
 
 /// Extra per-allocation data
@@ -1785,6 +1794,10 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         ecx.machine.monotonic_clock.tick();
 
         interp_ok(())
+    }
+
+    fn after_statement(ecx: &mut InterpCx<'tcx, Self>) -> InterpResult<'tcx> {
+        ecx.after_statement()
     }
 
     #[inline(always)]

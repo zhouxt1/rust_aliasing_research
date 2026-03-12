@@ -358,6 +358,18 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
     }
 
+    fn after_statement(&mut self) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        let Some(borrow_tracker) = &this.machine.borrow_tracker else {
+            return interp_ok(());
+        };
+        let method = borrow_tracker.borrow().borrow_tracker_method;
+        match method {
+            BorrowTrackerMethod::HybridBorrows => this.hb_after_statement(),
+            _ => interp_ok(()),
+        }
+    }
+
     fn on_stack_pop(
         &self,
         frame: &Frame<'tcx, Provenance, FrameExtra<'tcx>>,
@@ -524,6 +536,14 @@ impl AllocState {
 
         }
     }
+
+    // pub fn after_statement<'tcx>(&mut self) -> InterpResult<'tcx> {
+    //     //interp_ok(())
+    //     match self {
+    //         AllocState::HybridBorrows(hb) => hb.get_mut().hb_after_statement(),
+    //         _ => interp_ok(()),
+    //     }
+    // }
 
     pub fn remove_unreachable_tags(&self, tags: &FxHashSet<BorTag>) {
         let _trace = enter_trace_span!(borrow_tracker::remove_unreachable_tags);

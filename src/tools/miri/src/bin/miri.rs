@@ -56,7 +56,7 @@ use miri::{
 use rustc_abi::ExternAbi;
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_data_structures::sync::{self, DynSync};
-use rustc_borrowck::consumers::{self, ConsumerOptions, BodyWithBorrowckFacts};
+use rustc_borrowck::consumers::{self, ConsumerOptions, BodyWithBorrowckFacts, RustcFacts, BorrowIndex, PoloniusRegionVid};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_driver::Compilation;
 use rustc_hir::def_id::{LOCAL_CRATE, LocalDefId};
@@ -78,6 +78,7 @@ use rustc_span::def_id::DefId;
 use rustc_target::spec::Target;
 use rustc_middle::query::Providers;
 use rustc_middle::query::queries::mir_borrowck::ProvidedValue;
+use rustc_middle::mir::{Location, Rvalue, StatementKind, Terminator, Local};
 
 use crate::log::setup::{deinit_loggers, init_early_loggers, init_late_loggers};
 
@@ -227,6 +228,128 @@ fn make_miri_codegen_backend(opts: &Options, target: &Target) -> Box<dyn Codegen
     })
 }
 
+fn get_successor_loans(
+    terminator: &Terminator<'_>,
+    location_to_loans: &FxHashMap<Location, Vec<BorrowIndex>>,
+) -> Vec<BorrowIndex> {
+    let mut union_successors = std::collections::HashSet::new();
+    for succ in terminator.successors() {
+        let succ_loc = Location { block: succ, statement_index: 0 };
+        if let Some(loans) = location_to_loans.get(&succ_loc) {
+            for &loan in loans {
+                union_successors.insert(loan);
+            }
+        }
+    }
+    union_successors.into_iter().collect()
+}
+
+fn compute_return_borrowers<'tcx>(
+    body_with_facts: &BodyWithBorrowckFacts<'tcx>,
+    output: &polonius_engine::Output<RustcFacts>,
+) -> FxHashMap<Location, miri::ReturnBorrowers> {
+    let input_facts = body_with_facts.input_facts.as_ref().unwrap();
+    let location_table = body_with_facts.location_table.as_ref().unwrap();
+    let body = &body_with_facts.body;
+
+    let mut borrow_issuer_map = FxHashMap::default();
+    for (_region, loan, point) in &input_facts.loan_issued_at {
+        let location = location_table.to_location(*point);
+        if location.statement_index < body[location.block].statements.len() {
+            let stmt = &body[location.block].statements[location.statement_index];
+            if let StatementKind::Assign(assign_data) = &stmt.kind {
+                let (_, rvalue) = &**assign_data;
+                if let Rvalue::Ref(_, _, borrowed_place) = rvalue {
+                    borrow_issuer_map.insert(*loan, borrowed_place.clone());
+                }
+            }
+        }
+    }
+
+    let mut loan_killed_at_map= FxHashMap::default();
+    for (loan, point) in &input_facts.loan_killed_at {
+        loan_killed_at_map.entry(*loan).or_insert_with(Vec::new).push(*point);
+    }
+
+    let mut location_to_loans = FxHashMap::default();
+    let mut location_to_shared_loans = FxHashMap::default();
+    let mut location_to_two_phase_loans = FxHashMap::default();
+
+    for (point, loans) in &output.loan_live_at {
+        let location = location_table.to_location(*point);
+        let mut mut_loans = Vec::new();
+        let mut shared_loans = Vec::new();
+        let mut two_phase_loans = Vec::new();
+
+        for loan in loans {
+            let borrow_data = &body_with_facts.borrow_set[*loan];
+            match borrow_data.kind() {
+                rustc_middle::mir::BorrowKind::Mut { kind: rustc_middle::mir::MutBorrowKind::Default } => mut_loans.push(*loan),
+                rustc_middle::mir::BorrowKind::Mut { kind: rustc_middle::mir::MutBorrowKind::TwoPhaseBorrow } => two_phase_loans.push(*loan),
+                rustc_middle::mir::BorrowKind::Shared => shared_loans.push(*loan),
+                _ => {}
+            }
+        }
+        if !mut_loans.is_empty() { location_to_loans.insert(location, mut_loans); }
+        if !shared_loans.is_empty() { location_to_shared_loans.insert(location, shared_loans); }
+        if !two_phase_loans.is_empty() { location_to_two_phase_loans.insert(location, two_phase_loans); }
+    }
+
+    let mut result_map = FxHashMap::default();
+
+    for (i, block) in body.basic_blocks.iter().enumerate() {
+        let num_stmts = block.statements.len();
+        for j in 0..=num_stmts {
+            let loc = Location { block: rustc_middle::mir::BasicBlock::from_usize(i), statement_index: j };
+            let mut return_borrowers = miri::ReturnBorrowers::default();
+
+            let check_loans = |loans_map: &FxHashMap<Location, Vec<BorrowIndex>>| -> Vec<Local> {
+                let loans_alive = loans_map.get(&loc).map(|v| v.as_slice()).unwrap_or(&[]);
+                let next_loans_alive = if j < num_stmts {
+                    let next_loc = Location { block: loc.block, statement_index: j + 1 };
+                    loans_map.get(&next_loc).cloned().unwrap_or_default()
+                } else {
+                    get_successor_loans(block.terminator(), loans_map)
+                };
+
+                let dropped = loans_alive.iter().filter(|l| !next_loans_alive.contains(l));
+                let mut locals = Vec::new();
+                for &loan in dropped {
+                    if let Some(borrowed_place) = borrow_issuer_map.get(&loan) {
+                        let killed = loan_killed_at_map.get(&loan).map_or(false, |k| k.contains(&location_table.mid_index(loc)));
+                        if !killed {
+                            let local_decl = &body_with_facts.body.local_decls[borrowed_place.local];
+                            let mut is_region_dead = false;
+                            if let rustc_middle::ty::TyKind::Ref(region, _, _) = local_decl.ty.kind() {
+                                if let rustc_middle::ty::RegionKind::ReVar(vid) = region.kind() {
+                                    let point = location_table.start_index(loc);
+                                    if let Some(live_origins) = output.origin_live_on_entry.get(&point) {
+                                        if !live_origins.contains(&PoloniusRegionVid::from(vid)) { is_region_dead = true; }
+                                    } else { is_region_dead = true; }
+                                }
+                            }
+                            if !is_region_dead { locals.push(borrowed_place.local); }
+                        }
+                    }
+                }
+                locals
+            };
+
+            let mut_locals = check_loans(&location_to_loans);
+            if !mut_locals.is_empty() { return_borrowers.mut_borrows = Some(mut_locals); }
+            let shared_locals = check_loans(&location_to_shared_loans);
+            if !shared_locals.is_empty() { return_borrowers.shared = Some(shared_locals); }
+            let two_phase_locals = check_loans(&location_to_two_phase_loans);
+            if !two_phase_locals.is_empty() { return_borrowers.two_phase = Some(two_phase_locals); }
+
+            if return_borrowers.mut_borrows.is_some() || return_borrowers.shared.is_some() || return_borrowers.two_phase.is_some() {
+                result_map.insert(loc, return_borrowers);
+            }
+        }
+    }
+    result_map
+}
+
 impl rustc_driver::Callbacks for MiriCompilerCalls {
     fn config(&mut self, config: &mut rustc_interface::interface::Config) {
         config.make_codegen_backend = Some(Box::new(make_miri_codegen_backend));
@@ -271,10 +394,12 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
                     if let Some(input_facts) = &body_with_facts.input_facts {
                         let algorithm = polonius_engine::Algorithm::DatafrogOpt;
                         let output = polonius_engine::Output::compute(input_facts, algorithm, true);
+                        let return_borrows = compute_return_borrowers(body_with_facts, &output);
 
                         facts_map.insert(def_id.to_def_id(), miri::PoloniusFacts {
                             input_facts: *input_facts.clone(),
                             output_facts: output,
+                            return_borrowers: return_borrows,
                         });
                     }   
                     // if let Some(facts) = &body_with_facts.input_facts {
@@ -554,6 +679,9 @@ fn main() {
     let mut rustc_args = vec![];
     let mut after_dashdash = false;
 
+    // we force it to use hybrid borrow at this stage.
+    miri_config.borrow_tracker = Some(BorrowTrackerMethod::HybridBorrows);
+
     // Note that we require values to be given with `=`, not with a space.
     // This matches how rustc parses `-Z`.
     // However, unlike rustc we do not accept a space after `-Z`.
@@ -812,6 +940,9 @@ fn main() {
     }
     let many_seeds =
         many_seeds.map(|seeds| ManySeedsConfig { seeds, keep_going: many_seeds_keep_going });
+
+    // Add the compiler flag -Cpanic=abort. This is purely because we want to test the program in non-std environment
+    rustc_args.push("-Cpanic=abort".into());
 
     debug!("rustc arguments: {:?}", rustc_args);
     debug!("crate arguments: {:?}", miri_config.args);
