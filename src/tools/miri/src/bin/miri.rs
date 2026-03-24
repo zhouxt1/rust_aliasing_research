@@ -353,6 +353,10 @@ fn compute_return_borrowers<'tcx>(
             }
         }
     }
+
+    // Now we also want to do it for the liveness of shared references. 
+    
+
     (result_map, loan_live_at)
 }
 

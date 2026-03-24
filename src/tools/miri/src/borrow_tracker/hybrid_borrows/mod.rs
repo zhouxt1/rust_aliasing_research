@@ -437,7 +437,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         // print loan live at the current location
                         //let loc_index = facts.location_table.to_index(target_loc);
                         if let Some(loans) = facts.loan_live_at.get(&target_loc) {
-                            println!("      Loan live at {:?}: {:?}", target_loc, loans);
+                            // this is printed for debug only. We don't need to keep track of these in production. 
+                            println!("      Loan live at {:?}: {:?}", target_loc, loans);                             
                         }
 
                         if let Some(return_borrowers) = facts.return_borrowers.get(&target_loc) {
@@ -475,7 +476,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                                 }
                             }
                             
-                            // process shared borrows as well as two-phase borrows
+                            // process shared borrows
                             if let Some(shared_loans) = shared_locals {
                                 println!("Found return shared borrowers at {:?}: {:?}", target_loc, shared_loans);
 
@@ -500,14 +501,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                                     if let AllocKind::LiveData = this.get_alloc_info(alloc_id).kind {
                                         let mut borrower_state = this.get_alloc_extra(alloc_id)?.borrow_tracker_hb().borrow_mut();
                                         if borrower_state.perms.permission == BorrowerPermission::Read {
-                                            let mut shared_borrower_info = &mut borrower_state.shared_borrower.unwrap();
+                                            let shared_borrower_info = borrower_state.shared_borrower.as_mut().unwrap();
                                             shared_borrower_info.1 -= 1;
+                                            println!("Updated allocation {:?} with {:?} shared refs", alloc_id, shared_borrower_info.1);
                                             if shared_borrower_info.1 == 0 {
                                                 // transition to Frozen state
                                                 borrower_state.perms.permission = BorrowerPermission::Frozen;
                                                 println!("Shared borrower for allocation {:?} is now frozen", alloc_id);
                                             }
-                                            println!("Updated allocation {:?} with {:?} shared refs", alloc_id, shared_borrower_info.1);
                                         }
 
                                     }
