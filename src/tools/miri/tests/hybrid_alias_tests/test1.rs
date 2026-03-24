@@ -22,6 +22,8 @@ pub fn miri_start(_argc: isize, _argv: *const *const u8) -> isize {
     
     *ref1 += 1; 
 
+    unsafe {*ptr2 += 1; }
+
     x += 1;
     0
 }

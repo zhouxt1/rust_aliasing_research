@@ -278,7 +278,7 @@ pub fn create_ecx<'tcx>(
     entry_type: MiriEntryFnType,
     config: &MiriConfig,
     genmc_ctx: Option<Rc<GenmcCtx>>,
-    polonius_facts: Option<FxHashMap<DefId, crate::machine::PoloniusFacts>>,
+    polonius_facts: Option<FxHashMap<DefId, crate::machine::PoloniusFacts<'tcx>>>,
 ) -> InterpResult<'tcx, InterpCx<'tcx, MiriMachine<'tcx>>> {
     let typing_env = ty::TypingEnv::fully_monomorphized();
     let layout_cx = LayoutCx::new(tcx, typing_env);
@@ -461,7 +461,7 @@ pub fn eval_entry<'tcx>(
     entry_type: MiriEntryFnType,
     config: &MiriConfig,
     genmc_ctx: Option<Rc<GenmcCtx>>,
-    polonius_facts: Option<FxHashMap<DefId, crate::machine::PoloniusFacts>>,
+    polonius_facts: Option<FxHashMap<DefId, crate::machine::PoloniusFacts<'tcx>>>,
 ) -> Result<(), NonZeroI32> {
     // Copy setting before we move `config`.
     let ignore_leaks = config.ignore_leaks;

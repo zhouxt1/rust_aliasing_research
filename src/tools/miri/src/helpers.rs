@@ -442,8 +442,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
-        // Get MIR.
+        // Get MIR. We need to load the polonius MIR instead
         let mir = this.load_mir(f.def, None)?;
+        println!("Loaded MIR from call_function {:?}", f.def);
+
         let dest = match dest {
             Some(dest) => dest.clone(),
             None => MPlaceTy::fake_alloc_zst(this.machine.layouts.unit),

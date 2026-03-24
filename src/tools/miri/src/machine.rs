@@ -42,7 +42,7 @@ use crate::concurrency::{
     AllocDataRaceHandler, GenmcCtx, GenmcEvalContextExt as _, GlobalDataRaceHandler, weak_memory,
 };
 
-use rustc_borrowck::consumers::{PoloniusInput, RustcFacts};
+use rustc_borrowck::consumers::{BorrowIndex, PoloniusInput, RustcFacts};
 use polonius_engine::Output;
 
 use crate::*;
@@ -377,10 +377,12 @@ impl ProvenanceExtra {
 }
 
 #[derive(Clone)]
-pub struct PoloniusFacts {
-    pub input_facts: PoloniusInput,
-    pub output_facts: Output<RustcFacts>,
+pub struct PoloniusFacts<'tcx> {
+    // pub input_facts: PoloniusInput,
+    // pub output_facts: Output<RustcFacts>,
+    pub loan_live_at: FxHashMap<Location, Vec<BorrowIndex>>,
     pub return_borrowers: FxHashMap<Location, ReturnBorrowers>,
+    pub body: mir::Body<'tcx>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -677,7 +679,7 @@ pub struct MiriMachine<'tcx> {
     pub short_fd_operations: bool,
 
     /// Polonius facts and output for Hybrid Borrows.
-    pub(crate) polonius_facts: Option<FxHashMap<DefId, PoloniusFacts>>,
+    pub(crate) polonius_facts: Option<FxHashMap<DefId, PoloniusFacts<'tcx>>>,
 }
 
 impl<'tcx> MiriMachine<'tcx> {
@@ -688,7 +690,7 @@ impl<'tcx> MiriMachine<'tcx> {
         config: &MiriConfig,
         layout_cx: LayoutCx<'tcx>,
         genmc_ctx: Option<Rc<GenmcCtx>>,
-        polonius_facts: Option<FxHashMap<DefId, PoloniusFacts>>,
+        polonius_facts: Option<FxHashMap<DefId, PoloniusFacts<'tcx>>>,
     ) -> Self {
         let tcx = layout_cx.tcx();
         let user_relevant_crates = Self::get_user_relevant_crates(tcx, config);
@@ -1201,6 +1203,25 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
     #[inline(always)]
     fn ignore_optional_overflow_checks(ecx: &MiriInterpCx<'tcx>) -> bool {
         !ecx.tcx.sess.overflow_checks()
+    }
+
+    // define our own 'load_mir' here
+    fn load_mir(
+            ecx: &InterpCx<'tcx, Self>,
+            instance: ty::InstanceKind<'tcx>,
+        ) -> &'tcx mir::Body<'tcx> {
+        let func_id = instance.def_id();
+
+        println!("Loading the Polonius MIR into Miri for function {:?}", func_id); 
+        
+        if let Some(facts_map) = &ecx.machine.polonius_facts {
+            if let Some(facts) = facts_map.get(&func_id) {
+                // Allocate the body on the TyCtxt arena to get a &'tcx reference
+                return ecx.tcx.arena.alloc(facts.body.clone());
+            }
+        }
+        
+        ecx.tcx.instance_mir(instance)
     }
 
     fn check_fn_target_features(

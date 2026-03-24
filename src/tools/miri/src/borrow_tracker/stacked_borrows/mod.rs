@@ -534,7 +534,7 @@ impl Stacks {
             interpret::Pointer::new(alloc_id, range.start),
             range.size.bytes()
         );
-        let dcx = DiagnosticCxBuilder::read(machine, tag, range);
+        let dcx: DiagnosticCxBuilder<'_, '_> = DiagnosticCxBuilder::read(machine, tag, range);
         let state = machine.borrow_tracker.as_ref().unwrap().borrow();
         self.for_each(range, dcx, |stack, dcx, exposed_tags| {
             stack.access(AccessKind::Read, tag, &state, dcx, exposed_tags)

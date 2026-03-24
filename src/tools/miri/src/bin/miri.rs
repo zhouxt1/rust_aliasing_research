@@ -78,7 +78,7 @@ use rustc_span::def_id::DefId;
 use rustc_target::spec::Target;
 use rustc_middle::query::Providers;
 use rustc_middle::query::queries::mir_borrowck::ProvidedValue;
-use rustc_middle::mir::{Location, Rvalue, StatementKind, Terminator, Local};
+use rustc_middle::mir::{self, Local, Location, Rvalue, StatementKind, Terminator};
 
 use crate::log::setup::{deinit_loggers, init_early_loggers, init_late_loggers};
 
@@ -95,6 +95,7 @@ fn mir_borrowck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> ProvidedValue<'t
     let opts = ConsumerOptions::PoloniusInputFacts;
     let bodies_with_facts = consumers::get_bodies_with_borrowck_facts(tcx, def_id, opts);
     // SAFETY: The reader casts the 'static lifetime to 'tcx before using it.
+    // so we do it backwards when we retrieve it...
     let bodies_with_facts: FxHashMap<LocalDefId, BodyWithBorrowckFacts<'static>> =
         unsafe { std::mem::transmute(bodies_with_facts) };
     MIR_BODIES.with(|state| {
@@ -247,7 +248,7 @@ fn get_successor_loans(
 fn compute_return_borrowers<'tcx>(
     body_with_facts: &BodyWithBorrowckFacts<'tcx>,
     output: &polonius_engine::Output<RustcFacts>,
-) -> FxHashMap<Location, miri::ReturnBorrowers> {
+) -> (FxHashMap<Location, miri::ReturnBorrowers>, FxHashMap<Location, Vec<BorrowIndex>>) {
     let input_facts = body_with_facts.input_facts.as_ref().unwrap();
     let location_table = body_with_facts.location_table.as_ref().unwrap();
     let body = &body_with_facts.body;
@@ -275,6 +276,8 @@ fn compute_return_borrowers<'tcx>(
     let mut location_to_shared_loans = FxHashMap::default();
     let mut location_to_two_phase_loans = FxHashMap::default();
 
+    let mut loan_live_at = FxHashMap::default();
+
     for (point, loans) in &output.loan_live_at {
         let location = location_table.to_location(*point);
         let mut mut_loans = Vec::new();
@@ -290,9 +293,12 @@ fn compute_return_borrowers<'tcx>(
                 _ => {}
             }
         }
+
         if !mut_loans.is_empty() { location_to_loans.insert(location, mut_loans); }
         if !shared_loans.is_empty() { location_to_shared_loans.insert(location, shared_loans); }
         if !two_phase_loans.is_empty() { location_to_two_phase_loans.insert(location, two_phase_loans); }
+
+        loan_live_at.insert(location, loans.to_vec());
     }
 
     let mut result_map = FxHashMap::default();
@@ -347,8 +353,9 @@ fn compute_return_borrowers<'tcx>(
             }
         }
     }
-    result_map
+    (result_map, loan_live_at)
 }
+
 
 impl rustc_driver::Callbacks for MiriCompilerCalls {
     fn config(&mut self, config: &mut rustc_interface::interface::Config) {
@@ -389,22 +396,27 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
             let mut facts_map = rustc_data_structures::fx::FxHashMap::default();
             MIR_BODIES.with(|state| {
                 let map = state.borrow();
-                for (def_id, body_with_facts) in map.iter() {
+                for (def_id, body_with_facts) in map.iter() {      
+
+                    let body_with_facts: &BodyWithBorrowckFacts<'tcx> =
+                        unsafe { std::mem::transmute(body_with_facts) };
 
                     if let Some(input_facts) = &body_with_facts.input_facts {
                         let algorithm = polonius_engine::Algorithm::DatafrogOpt;
                         let output = polonius_engine::Output::compute(input_facts, algorithm, true);
-                        let return_borrows = compute_return_borrowers(body_with_facts, &output);
+                        let (return_borrows, loan_live_at) = compute_return_borrowers(body_with_facts, &output);
 
                         facts_map.insert(def_id.to_def_id(), miri::PoloniusFacts {
-                            input_facts: *input_facts.clone(),
-                            output_facts: output,
+                            // input_facts: *input_facts.clone(),
+                            // output_facts: output,
+                            loan_live_at, 
                             return_borrowers: return_borrows,
+                            body: body_with_facts.body.clone(), //coerce_lifetime(body_with_facts.body.clone()),
                         });
-                    }   
-                    // if let Some(facts) = &body_with_facts.input_facts {
-                    //     facts_map.insert(def_id.to_def_id(), facts.clone());
-                    // }
+                    }
+
+                    // This body_with_facts.body is Important. I need to replace the body used by the interpreter with this Body. 
+                    
                 }                
             });
             Some(facts_map)
