@@ -248,7 +248,10 @@ fn get_successor_loans(
 fn compute_return_borrowers<'tcx>(
     body_with_facts: &BodyWithBorrowckFacts<'tcx>,
     output: &polonius_engine::Output<RustcFacts>,
-) -> (FxHashMap<Location, miri::ReturnBorrowers>, FxHashMap<Location, Vec<BorrowIndex>>) {
+) -> (
+    FxHashMap<Location, miri::ReturnBorrowers>,
+    FxHashMap<Location, miri::PoloniusLocationFacts>,
+) {
     let input_facts = body_with_facts.input_facts.as_ref().unwrap();
     let location_table = body_with_facts.location_table.as_ref().unwrap();
     let body = &body_with_facts.body;
@@ -276,7 +279,8 @@ fn compute_return_borrowers<'tcx>(
     let mut location_to_shared_loans = FxHashMap::default();
     let mut location_to_two_phase_loans = FxHashMap::default();
 
-    let mut loan_live_at = FxHashMap::default();
+    
+    let mut live_on_entry = FxHashMap::default();
 
     for (point, loans) in &output.loan_live_at {
         let location = location_table.to_location(*point);
@@ -298,7 +302,17 @@ fn compute_return_borrowers<'tcx>(
         if !shared_loans.is_empty() { location_to_shared_loans.insert(location, shared_loans); }
         if !two_phase_loans.is_empty() { location_to_two_phase_loans.insert(location, two_phase_loans); }
 
-        loan_live_at.insert(location, loans.to_vec());
+        live_on_entry.entry(location).or_insert_with(miri::PoloniusLocationFacts::default).loans = loans.to_vec();
+    }
+
+    for (point, origins) in &output.origin_live_on_entry {
+        let location = location_table.to_location(*point);
+        live_on_entry.entry(location).or_insert_with(miri::PoloniusLocationFacts::default).origins = origins.to_vec();
+    }
+
+    for (point, vars) in &output.var_live_on_entry {
+        let location = location_table.to_location(*point);
+        live_on_entry.entry(location).or_insert_with(miri::PoloniusLocationFacts::default).vars = vars.to_vec();
     }
 
     let mut result_map = FxHashMap::default();
@@ -328,9 +342,10 @@ fn compute_return_borrowers<'tcx>(
                             let mut is_region_dead = false;
                             if let rustc_middle::ty::TyKind::Ref(region, _, _) = local_decl.ty.kind() {
                                 if let rustc_middle::ty::RegionKind::ReVar(vid) = region.kind() {
-                                    let point = location_table.start_index(loc);
-                                    if let Some(live_origins) = output.origin_live_on_entry.get(&point) {
-                                        if !live_origins.contains(&PoloniusRegionVid::from(vid)) { is_region_dead = true; }
+                                    if let Some(location_facts) = live_on_entry.get(&loc) {
+                                        if !location_facts.origins.contains(&PoloniusRegionVid::from(vid)) {
+                                            is_region_dead = true;
+                                        }
                                     } else { is_region_dead = true; }
                                 }
                             }
@@ -357,7 +372,7 @@ fn compute_return_borrowers<'tcx>(
     // Now we also want to do it for the liveness of shared references. 
     
 
-    (result_map, loan_live_at)
+    (result_map, live_on_entry)
 }
 
 
@@ -408,12 +423,12 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
                     if let Some(input_facts) = &body_with_facts.input_facts {
                         let algorithm = polonius_engine::Algorithm::DatafrogOpt;
                         let output = polonius_engine::Output::compute(input_facts, algorithm, true);
-                        let (return_borrows, loan_live_at) = compute_return_borrowers(body_with_facts, &output);
+                        let (return_borrows, live_on_entry) = compute_return_borrowers(body_with_facts, &output);
 
                         facts_map.insert(def_id.to_def_id(), miri::PoloniusFacts {
                             // input_facts: *input_facts.clone(),
                             // output_facts: output,
-                            loan_live_at, 
+                            live_on_entry,
                             return_borrowers: return_borrows,
                             body: body_with_facts.body.clone(), //coerce_lifetime(body_with_facts.body.clone()),
                         });

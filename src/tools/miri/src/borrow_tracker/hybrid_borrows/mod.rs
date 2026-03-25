@@ -436,9 +436,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     if let Either::Left(target_loc) = loc {
                         // print loan live at the current location
                         //let loc_index = facts.location_table.to_index(target_loc);
-                        if let Some(loans) = facts.loan_live_at.get(&target_loc) {
+                        if let Some(location_facts) = facts.live_on_entry.get(&target_loc) {
                             // this is printed for debug only. We don't need to keep track of these in production. 
-                            println!("      Loan live at {:?}: {:?}", target_loc, loans);                             
+                            println!("      Live on entry at {:?}: loans={:?}, origins={:?}, vars={:?}",
+                                target_loc,
+                                location_facts.loans,
+                                location_facts.origins,
+                                location_facts.vars,
+                            );
                         }
 
                         if let Some(return_borrowers) = facts.return_borrowers.get(&target_loc) {
@@ -529,4 +534,3 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 }
-

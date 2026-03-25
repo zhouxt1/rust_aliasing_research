@@ -42,7 +42,7 @@ use crate::concurrency::{
     AllocDataRaceHandler, GenmcCtx, GenmcEvalContextExt as _, GlobalDataRaceHandler, weak_memory,
 };
 
-use rustc_borrowck::consumers::{BorrowIndex, PoloniusInput, RustcFacts};
+use rustc_borrowck::consumers::{BorrowIndex, PoloniusInput, PoloniusRegionVid, RustcFacts};
 use polonius_engine::Output;
 
 use crate::*;
@@ -380,9 +380,16 @@ impl ProvenanceExtra {
 pub struct PoloniusFacts<'tcx> {
     // pub input_facts: PoloniusInput,
     // pub output_facts: Output<RustcFacts>,
-    pub loan_live_at: FxHashMap<Location, Vec<BorrowIndex>>,
+    pub live_on_entry: FxHashMap<Location, PoloniusLocationFacts>,
     pub return_borrowers: FxHashMap<Location, ReturnBorrowers>,
     pub body: mir::Body<'tcx>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct PoloniusLocationFacts {
+    pub loans: Vec<BorrowIndex>,
+    pub origins: Vec<PoloniusRegionVid>,
+    pub vars: Vec<Local>,
 }
 
 #[derive(Debug, Default, Clone)]
