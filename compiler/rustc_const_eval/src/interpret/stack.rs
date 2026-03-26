@@ -105,6 +105,10 @@ pub struct Frame<'tcx, Prov: Provenance = CtfeProvenance, Extra = ()> {
     ///
     /// Needs to be public because ConstProp does unspeakable things to it.
     pub(super) loc: Either<mir::Location, Span>,
+
+    /// The concrete predecessor block along the current execution trace for `loc.block`.
+    /// This is dynamic trace information, not the full CFG predecessor set.
+    pub(super) last_pred: Option<mir::BasicBlock>,
 }
 
 /// Where and how to continue when returning/unwinding from the current function.
@@ -260,6 +264,7 @@ impl<'tcx, Prov: Provenance> Frame<'tcx, Prov> {
             return_place: self.return_place,
             locals: self.locals,
             loc: self.loc,
+            last_pred: self.last_pred,
             extra,
             tracing_span: self.tracing_span,
         }
@@ -276,6 +281,10 @@ impl<'tcx, Prov: Provenance, Extra> Frame<'tcx, Prov, Extra> {
     /// Used by [priroda](https://github.com/oli-obk/priroda).
     pub fn current_loc(&self) -> Either<mir::Location, Span> {
         self.loc
+    }
+
+    pub fn current_pred_block(&self) -> Option<mir::BasicBlock> {
+        self.last_pred
     }
 
     pub fn body(&self) -> &'tcx mir::Body<'tcx> {
@@ -379,6 +388,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             locals,
             instance,
             tracing_span: SpanGuard::new(),
+            last_pred: None,
             extra: (),
         };
         let frame = M::init_frame(self, pre_frame)?;

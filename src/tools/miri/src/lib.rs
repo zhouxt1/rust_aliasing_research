@@ -151,7 +151,8 @@ pub use crate::machine::{
     AlignmentCheck, AllocExtra, BacktraceStyle, DynMachineCallback, FloatRoundingErrorMode,
     FrameExtra, IsolatedOp, MachineCallback, MemoryKind, MiriInterpCx, MiriInterpCxExt,
     MiriMachine, MiriMemoryKind, PoloniusFacts, PoloniusLocationFacts, PrimitiveLayouts,
-    Provenance, ProvenanceExtra, RejectOpWith, ValidationMode, ReturnBorrowers
+    Provenance, ProvenanceExtra, RecordedRetag, RecordedRetagTiming, RejectOpWith, ValidationMode,
+    ReturnBorrowers
 };
 pub use crate::operator::EvalContextExt as _;
 pub use crate::provenance_gc::{EvalContextExt as _, LiveAllocs, VisitProvenance, VisitWith};

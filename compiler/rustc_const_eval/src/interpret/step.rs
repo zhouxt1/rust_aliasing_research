@@ -50,6 +50,9 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             self.return_from_current_stack_frame(/* unwinding */ true)?;
             return interp_ok(true);
         };
+        // if loc.statement_index == 0 {
+        //     println!("// entering {:?} from {:?}", loc.block, self.frame().last_pred);
+        // }
         let basic_block = &self.body().basic_blocks[loc.block];
 
         if let Some(stmt) = basic_block.statements.get(loc.statement_index) {
@@ -89,6 +92,9 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         .or_if_tracing_disabled(|| info!(stmt = ?stmt.kind));
 
         use rustc_middle::mir::StatementKind::*;
+
+        M::before_statement(self)?;
+
 
         match &stmt.kind {
             Assign(box (place, rvalue)) => self.eval_rvalue_into_place(rvalue, *place)?,
@@ -501,12 +507,19 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         .or_if_tracing_disabled(|| info!(terminator = ?terminator.kind));
 
         use rustc_middle::mir::TerminatorKind::*;
+        let pred = match self.frame().loc {
+            Either::Left(loc) => Some(loc.block),
+            Either::Right(_) => None,
+        };
         match terminator.kind {
             Return => {
                 self.return_from_current_stack_frame(/* unwinding */ false)?
             }
 
-            Goto { target } => self.go_to_block(target),
+            Goto { target } => {
+                self.frame_mut().last_pred = pred;
+                self.go_to_block(target)
+            }
 
             SwitchInt { ref discr, ref targets } => {
                 let discr = self.read_immediate(&self.eval_operand(discr, None)?)?;
@@ -529,6 +542,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                     }
                 }
 
+                self.frame_mut().last_pred = pred;
                 self.go_to_block(target_block);
             }
 
@@ -565,6 +579,9 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 {
                     span_bug!(terminator.source_info.span, "evaluating this call made no progress");
                 }
+                if self.frame_idx() == old_stack && self.frame().loc != old_loc {
+                    self.frame_mut().last_pred = old_loc.left().map(|loc| loc.block);
+                }
             }
 
             TailCall { ref func, ref args, fn_span: _ } => {
@@ -599,6 +616,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                     // whatsoever. This can happen as a result of monomorphizing a drop of a
                     // generic. In order to make sure that generic and non-generic code behaves
                     // roughly the same (and in keeping with Mir semantics) we do nothing here.
+                    self.frame_mut().last_pred = pred;
                     self.go_to_block(target);
                     return interp_ok(());
                 }
@@ -611,6 +629,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                     M::ignore_optional_overflow_checks(self) && msg.is_optional_overflow_check();
                 let cond_val = self.read_scalar(&self.eval_operand(cond, None)?)?.to_bool()?;
                 if ignored || expected == cond_val {
+                    self.frame_mut().last_pred = pred;
                     self.go_to_block(target);
                 } else {
                     M::assert_panic(self, msg, unwind)?;

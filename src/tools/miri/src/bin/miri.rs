@@ -7,6 +7,7 @@
     rustc::diagnostic_outside_of_impl,
     rustc::untranslatable_diagnostic
 )]
+#![feature(box_patterns)]
 
 // The rustc crates we need
 extern crate rustc_abi;
@@ -60,7 +61,7 @@ use rustc_borrowck::consumers::{self, ConsumerOptions, BodyWithBorrowckFacts, Ru
 use rustc_data_structures::fx::FxHashMap;
 use rustc_driver::Compilation;
 use rustc_hir::def_id::{LOCAL_CRATE, LocalDefId};
-use rustc_hir::{self as hir, Node};
+use rustc_hir::{self as hir, Node, target};
 use rustc_hir_analysis::check::check_function_signature;
 use rustc_interface::interface::Config;
 use rustc_interface::util::DummyCodegenBackend;
@@ -78,7 +79,7 @@ use rustc_span::def_id::DefId;
 use rustc_target::spec::Target;
 use rustc_middle::query::Providers;
 use rustc_middle::query::queries::mir_borrowck::ProvidedValue;
-use rustc_middle::mir::{self, Local, Location, Rvalue, StatementKind, Terminator};
+use rustc_middle::mir::{Local, Location, Place, RetagKind, Rvalue, START_BLOCK, StatementKind, Terminator, TerminatorKind};
 
 use crate::log::setup::{deinit_loggers, init_early_loggers, init_late_loggers};
 
@@ -245,12 +246,130 @@ fn get_successor_loans(
     union_successors.into_iter().collect()
 }
 
+fn may_contain_reference<'tcx>(ty: Ty<'tcx>, depth: u32, tcx: TyCtxt<'tcx>) -> bool {
+    match ty.kind() {
+        ty::Bool
+        | ty::Char
+        | ty::Float(_)
+        | ty::Int(_)
+        | ty::Uint(_)
+        | ty::RawPtr(..)
+        | ty::FnPtr(..)
+        | ty::Str
+        | ty::FnDef(..)
+        | ty::Never => false,
+        ty::Ref(..) => true,
+        ty::Adt(..) if ty.is_box() => true,
+        ty::Array(ty, _) | ty::Slice(ty) => may_contain_reference(*ty, depth, tcx),
+        ty::Tuple(tys) => depth == 0 || tys.iter().any(|ty| may_contain_reference(ty, depth - 1, tcx)),
+        ty::Adt(adt, args) => {
+            depth == 0
+                || adt.variants().iter().any(|v| {
+                    v.fields.iter().any(|f| may_contain_reference(f.ty(tcx, args), depth - 1, tcx))
+                })
+        }
+        _ => true,
+    }
+}
+
+fn compute_retags<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &rustc_middle::mir::Body<'tcx>,
+) -> FxHashMap<Location, Vec<miri::RecordedRetag<'tcx>>> {
+
+    //let basic_blocks = body.basic_blocks.as_mut();
+    let local_decls = &body.local_decls;
+    let needs_retag = |place: &Place<'tcx>| {
+        !place.is_indirect_first_projection()
+            && may_contain_reference(place.ty(local_decls, tcx).ty, 3, tcx)
+            && !local_decls[place.local].is_deref_temp()
+    };
+
+    let mut retags = FxHashMap::default();
+    let mut push_retag = |location: Location,
+                          timing: miri::RecordedRetagTiming,
+                          kind: RetagKind,
+                          place: Place<'tcx>| {
+        retags.entry(location).or_insert_with(Vec::new).push(miri::RecordedRetag {
+            timing,
+            kind,
+            place,
+        });
+    };
+
+    for (local, _) in local_decls.iter_enumerated().skip(1).take(body.arg_count) {
+        let place = Place::from(local);
+        if needs_retag(&place) {
+            push_retag(
+                Location { block: START_BLOCK, statement_index: 0 },
+                miri::RecordedRetagTiming::BeforeInstruction,
+                RetagKind::FnEntry,
+                place,
+            );
+        }
+    }
+
+    // Record return-destination retags on the source call terminator. `AddRetag`
+    // uses `AllCallEdges` to make this edge-specific; on the original body, the
+    // call terminator is the precise per-edge anchor we still have.
+    // Note: These are returns, but not the reference that has been used and returned. 
+    let returns = body.basic_blocks
+        .iter()
+        .filter_map(|block_data| {
+            match block_data.terminator().kind {
+                TerminatorKind::Call { target: Some(target), destination, .. } if needs_retag(&destination) => {
+                    Some((block_data.terminator().source_info, destination, target))
+                }
+                _ => None,
+            }
+        }
+    ).collect::<Vec<_>>();
+    for (_, destination, dest_block) in returns {
+       //body.basic_blocks[dest_block].statements
+       push_retag(
+            Location { block: dest_block, statement_index: 0 },
+            miri::RecordedRetagTiming::BeforeInstruction,
+            RetagKind::Default,
+            destination,
+        );
+    }
+
+    for (block, block_data) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, statement) in block_data.statements.iter().enumerate() {
+            let StatementKind::Assign(box (place, rvalue)) = &statement.kind else { continue };
+            let retag_kind = match rvalue {
+                Rvalue::RawPtr(_mutbl, place) => {
+                    if place.is_indirect_first_projection() && body.local_decls[place.local].ty.is_box_global(tcx) {
+                        Some(RetagKind::Raw)
+                    } else {
+                        None
+                    }
+                }
+                Rvalue::Ref(..) => None,
+                _ if needs_retag(place) => Some(RetagKind::Default),
+                _ => None,
+            };
+            if let Some(kind) = retag_kind {
+                push_retag(
+                    Location { block, statement_index: statement_index + 1 },
+                    miri::RecordedRetagTiming::BeforeInstruction,
+                    kind,
+                    *place,
+                );
+            }
+        }
+    }
+
+    retags
+}
+
 fn compute_return_borrowers<'tcx>(
     body_with_facts: &BodyWithBorrowckFacts<'tcx>,
     output: &polonius_engine::Output<RustcFacts>,
 ) -> (
     FxHashMap<Location, miri::ReturnBorrowers>,
     FxHashMap<Location, miri::PoloniusLocationFacts>,
+    FxHashMap<rustc_middle::mir::BasicBlock, FxHashMap<rustc_middle::mir::BasicBlock, miri::ReturnBorrowers>>,
 ) {
     let input_facts = body_with_facts.input_facts.as_ref().unwrap();
     let location_table = body_with_facts.location_table.as_ref().unwrap();
@@ -279,7 +398,6 @@ fn compute_return_borrowers<'tcx>(
     let mut location_to_shared_loans = FxHashMap::default();
     let mut location_to_two_phase_loans = FxHashMap::default();
 
-    
     let mut live_on_entry = FxHashMap::default();
 
     for (point, loans) in &output.loan_live_at {
@@ -312,10 +430,61 @@ fn compute_return_borrowers<'tcx>(
 
     for (point, vars) in &output.var_live_on_entry {
         let location = location_table.to_location(*point);
-        live_on_entry.entry(location).or_insert_with(miri::PoloniusLocationFacts::default).vars = vars.to_vec();
+        let shared_ref_vars: Vec<Local> = vars
+            .iter()
+            .copied()
+            .filter(|&local| {
+                matches!(
+                    body_with_facts.body.local_decls[local].ty.kind(),
+                    rustc_middle::ty::TyKind::Ref(_, _, rustc_middle::ty::Mutability::Not)
+                )
+            })
+            .collect();
+        live_on_entry.entry(location).or_insert_with(miri::PoloniusLocationFacts::default).vars =
+            shared_ref_vars;
     }
+    
+    let check_loans_between =
+        |from_loc: Location,
+         to_loc: Location,
+         loans_map: &FxHashMap<Location, Vec<BorrowIndex>>|
+         -> Vec<Local> {
+            let loans_alive = loans_map.get(&from_loc).map(|v| v.as_slice()).unwrap_or(&[]);
+            let next_loans_alive = loans_map.get(&to_loc).map(|v| v.as_slice()).unwrap_or(&[]);
+
+            let dropped = loans_alive.iter().filter(|l| !next_loans_alive.contains(l));
+            let mut locals = Vec::new();
+            for &loan in dropped {
+                if let Some(borrowed_place) = borrow_issuer_map.get(&loan) {
+                    let killed = loan_killed_at_map
+                        .get(&loan)
+                        .map_or(false, |k| k.contains(&location_table.mid_index(from_loc)));
+                    if !killed {
+                        let local_decl = &body_with_facts.body.local_decls[borrowed_place.local];
+                        let mut is_region_dead = false;
+                        if let rustc_middle::ty::TyKind::Ref(region, _, _) = local_decl.ty.kind() {
+                            if let rustc_middle::ty::RegionKind::ReVar(vid) = region.kind() {
+                                if let Some(location_facts) = live_on_entry.get(&from_loc) {
+                                    if !location_facts.origins.contains(&PoloniusRegionVid::from(vid))
+                                    {
+                                        is_region_dead = true;
+                                    }
+                                } else {
+                                    is_region_dead = true;
+                                }
+                            }
+                        }
+                        if !is_region_dead {
+                            locals.push(borrowed_place.local);
+                        }
+                    }
+                }
+            }
+            locals
+        };
 
     let mut result_map = FxHashMap::default();
+
 
     for (i, block) in body.basic_blocks.iter().enumerate() {
         let num_stmts = block.statements.len();
@@ -324,36 +493,50 @@ fn compute_return_borrowers<'tcx>(
             let mut return_borrowers = miri::ReturnBorrowers::default();
 
             let check_loans = |loans_map: &FxHashMap<Location, Vec<BorrowIndex>>| -> Vec<Local> {
-                let loans_alive = loans_map.get(&loc).map(|v| v.as_slice()).unwrap_or(&[]);
-                let next_loans_alive = if j < num_stmts {
-                    let next_loc = Location { block: loc.block, statement_index: j + 1 };
-                    loans_map.get(&next_loc).cloned().unwrap_or_default()
-                } else {
-                    get_successor_loans(block.terminator(), loans_map)
-                };
-
-                let dropped = loans_alive.iter().filter(|l| !next_loans_alive.contains(l));
-                let mut locals = Vec::new();
-                for &loan in dropped {
-                    if let Some(borrowed_place) = borrow_issuer_map.get(&loan) {
-                        let killed = loan_killed_at_map.get(&loan).map_or(false, |k| k.contains(&location_table.mid_index(loc)));
-                        if !killed {
-                            let local_decl = &body_with_facts.body.local_decls[borrowed_place.local];
-                            let mut is_region_dead = false;
-                            if let rustc_middle::ty::TyKind::Ref(region, _, _) = local_decl.ty.kind() {
-                                if let rustc_middle::ty::RegionKind::ReVar(vid) = region.kind() {
-                                    if let Some(location_facts) = live_on_entry.get(&loc) {
-                                        if !location_facts.origins.contains(&PoloniusRegionVid::from(vid)) {
-                                            is_region_dead = true;
-                                        }
-                                    } else { is_region_dead = true; }
-                                }
-                            }
-                            if !is_region_dead { locals.push(borrowed_place.local); }
-                        }
-                    }
-                }
-                locals
+                let next_loc = Location { block: loc.block, statement_index: j + 1 };
+                // We can just ignore the other case. Because we already consider the case of a terminator by including the predecessors. 
+                // } else {
+                //     // Preserve the existing union-of-successors behavior for the flat
+                //     // per-location map. The edge-specific map below refines this by predecessor.
+                //     let next_loans_alive = get_successor_loans(block.terminator(), loans_map);
+                //     let loans_alive = loans_map.get(&loc).map(|v| v.as_slice()).unwrap_or(&[]);
+                //     let dropped = loans_alive.iter().filter(|l| !next_loans_alive.contains(l));
+                //     let mut locals = Vec::new();
+                //     for &loan in dropped {
+                //         if let Some(borrowed_place) = borrow_issuer_map.get(&loan) {
+                //             let killed = loan_killed_at_map.get(&loan).map_or(false, |k| {
+                //                 k.contains(&location_table.mid_index(loc))
+                //             });
+                //             if !killed {
+                //                 let local_decl =
+                //                     &body_with_facts.body.local_decls[borrowed_place.local];
+                //                 let mut is_region_dead = false;
+                //                 if let rustc_middle::ty::TyKind::Ref(region, _, _) =
+                //                     local_decl.ty.kind()
+                //                 {
+                //                     if let rustc_middle::ty::RegionKind::ReVar(vid) = region.kind()
+                //                     {
+                //                         if let Some(location_facts) = live_on_entry.get(&loc) {
+                //                             if !location_facts
+                //                                 .origins
+                //                                 .contains(&PoloniusRegionVid::from(vid))
+                //                             {
+                //                                 is_region_dead = true;
+                //                             }
+                //                         } else {
+                //                             is_region_dead = true;
+                //                         }
+                //                     }
+                //                 }
+                //                 if !is_region_dead {
+                //                     locals.push(borrowed_place.local);
+                //                 }
+                //             }
+                //         }
+                //     }
+                //     return locals;
+                // };
+                check_loans_between(loc, next_loc, loans_map)
             };
 
             let mut_locals = check_loans(&location_to_loans);
@@ -363,16 +546,117 @@ fn compute_return_borrowers<'tcx>(
             let two_phase_locals = check_loans(&location_to_two_phase_loans);
             if !two_phase_locals.is_empty() { return_borrowers.two_phase = Some(two_phase_locals); }
 
-            if return_borrowers.mut_borrows.is_some() || return_borrowers.shared.is_some() || return_borrowers.two_phase.is_some() {
+            // This probably also has to be changed? Idk coz the successor might not be accurate when calling another function. 
+            let shared_vars_alive = live_on_entry.get(&loc).map(|facts| facts.vars.as_slice()).unwrap_or(&[]);
+            let next_shared_vars_alive = if j < num_stmts {
+                let next_loc = Location { block: loc.block, statement_index: j + 1 };
+                live_on_entry.get(&next_loc).map(|facts| facts.vars.clone()).unwrap_or_default()
+            } else {
+                let mut union_successors = Vec::new();
+                for succ in block.terminator().successors() {
+                    let succ_loc = Location { block: succ, statement_index: 0 };
+                    if let Some(location_facts) = live_on_entry.get(&succ_loc) {
+                        for &local in &location_facts.vars {
+                            if !union_successors.contains(&local) {
+                                union_successors.push(local);
+                            }
+                        }
+                    }
+                }
+                union_successors
+            };
+            let dropped_shared_vars: Vec<Local> = shared_vars_alive
+                .iter()
+                .copied()
+                .filter(|local| !next_shared_vars_alive.contains(local))
+                .collect();
+            if !dropped_shared_vars.is_empty() {
+                return_borrowers.return_shared_var = Some(dropped_shared_vars);
+            }
+
+            if matches!(block.terminator().kind, TerminatorKind::Return) && j == num_stmts {
+                let return_ref_args: Vec<Local> = body
+                    .args_iter()
+                    .filter(|&local| {
+                        matches!(
+                            body.local_decls[local].ty.kind(),
+                            rustc_middle::ty::TyKind::Ref(..)
+                        )
+                    })
+                    .collect();
+                if !return_ref_args.is_empty() {
+                    return_borrowers.return_ref_args = Some(return_ref_args);
+                }
+            }
+
+            if return_borrowers.mut_borrows.is_some()
+                || return_borrowers.shared.is_some()
+                || return_borrowers.two_phase.is_some()
+                || return_borrowers.return_shared_var.is_some()
+                || return_borrowers.return_ref_args.is_some()
+            {
                 result_map.insert(loc, return_borrowers);
             }
         }
     }
 
-    // Now we also want to do it for the liveness of shared references. 
-    
+    let mut predecessor_borrowers = FxHashMap::default();
+    for bb in body.basic_blocks.indices() {
+        let bb_entry = Location { block: bb, statement_index: 0 };
+        let mut pred_map = FxHashMap::default();
+        for &pred_bb in body.basic_blocks.predecessors()[bb].iter() {
+            let pred_term = body.terminator_loc(pred_bb);
+            let mut return_borrowers = miri::ReturnBorrowers::default();
 
-    (result_map, live_on_entry)
+            let mut_locals = check_loans_between(pred_term, bb_entry, &location_to_loans);
+            if !mut_locals.is_empty() {
+                return_borrowers.mut_borrows = Some(mut_locals);
+            }
+
+            let shared_locals =
+                check_loans_between(pred_term, bb_entry, &location_to_shared_loans);
+            if !shared_locals.is_empty() {
+                return_borrowers.shared = Some(shared_locals);
+            }
+
+            let two_phase_locals =
+                check_loans_between(pred_term, bb_entry, &location_to_two_phase_loans);
+            if !two_phase_locals.is_empty() {
+                return_borrowers.two_phase = Some(two_phase_locals);
+            }
+
+            let shared_vars_alive = live_on_entry
+                .get(&pred_term)
+                .map(|facts| facts.vars.as_slice())
+                .unwrap_or(&[]);
+            let next_shared_vars_alive = live_on_entry
+                .get(&bb_entry)
+                .map(|facts| facts.vars.as_slice())
+                .unwrap_or(&[]);
+            let dropped_shared_vars: Vec<Local> = shared_vars_alive
+                .iter()
+                .copied()
+                .filter(|local| !next_shared_vars_alive.contains(local))
+                .collect();
+            if !dropped_shared_vars.is_empty() {
+                return_borrowers.return_shared_var = Some(dropped_shared_vars);
+            }
+
+            if return_borrowers.mut_borrows.is_some()
+                || return_borrowers.shared.is_some()
+                || return_borrowers.two_phase.is_some()
+                || return_borrowers.return_shared_var.is_some()
+            {
+                pred_map.insert(pred_bb, return_borrowers);
+            }
+        }
+        if !pred_map.is_empty() {
+            predecessor_borrowers.insert(bb, pred_map);
+        }
+    }
+
+    // Now we also want to do it for the liveness of shared references. 
+    (result_map, live_on_entry, predecessor_borrowers)
 }
 
 
@@ -423,13 +707,17 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
                     if let Some(input_facts) = &body_with_facts.input_facts {
                         let algorithm = polonius_engine::Algorithm::DatafrogOpt;
                         let output = polonius_engine::Output::compute(input_facts, algorithm, true);
-                        let (return_borrows, live_on_entry) = compute_return_borrowers(body_with_facts, &output);
+                        let (return_borrows, live_on_entry, predecessor_borrowers) =
+                            compute_return_borrowers(body_with_facts, &output);
+                        let retags = compute_retags(tcx, &body_with_facts.body);
 
                         facts_map.insert(def_id.to_def_id(), miri::PoloniusFacts {
                             // input_facts: *input_facts.clone(),
                             // output_facts: output,
                             live_on_entry,
                             return_borrowers: return_borrows,
+                            predecessor_borrowers,
+                            retags,
                             body: body_with_facts.body.clone(), //coerce_lifetime(body_with_facts.body.clone()),
                         });
                     }

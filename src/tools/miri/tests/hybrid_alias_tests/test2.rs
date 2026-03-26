@@ -77,7 +77,7 @@ pub fn test5() {
 pub fn miri_start(_argc: isize, _argv: *const *const u8) -> isize {
 
     //test4();
-    test5();
+    test4();
 
     0
 }

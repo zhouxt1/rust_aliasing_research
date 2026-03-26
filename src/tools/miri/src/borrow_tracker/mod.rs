@@ -358,6 +358,18 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
     }
 
+    fn before_statement(&mut self) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        let Some(borrow_tracker) = &this.machine.borrow_tracker else {
+            return interp_ok(());
+        };
+        let method = borrow_tracker.borrow().borrow_tracker_method;
+        match method {
+            BorrowTrackerMethod::HybridBorrows => this.hb_before_statement(),
+            _ => interp_ok(()),
+        }
+    }
+
     fn after_statement(&mut self) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let Some(borrow_tracker) = &this.machine.borrow_tracker else {
@@ -366,6 +378,18 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let method = borrow_tracker.borrow().borrow_tracker_method;
         match method {
             BorrowTrackerMethod::HybridBorrows => this.hb_after_statement(),
+            _ => interp_ok(()),
+        }
+    }
+
+    fn before_terminator(&mut self) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        let Some(borrow_tracker) = &this.machine.borrow_tracker else {
+            return interp_ok(());
+        };
+        let method = borrow_tracker.borrow().borrow_tracker_method;
+        match method {
+            BorrowTrackerMethod::HybridBorrows => this.hb_before_terminator(),
             _ => interp_ok(()),
         }
     }

@@ -298,6 +298,10 @@ pub trait Machine<'tcx>: Sized {
         interp_ok(())
     }
 
+    fn before_statement(_ecx: &mut InterpCx<'tcx, Self>) -> InterpResult<'tcx> {
+        interp_ok(())
+    }
+
     fn after_statement(_ecx: &mut InterpCx<'tcx, Self>) -> InterpResult<'tcx> {
         interp_ok(())
     }

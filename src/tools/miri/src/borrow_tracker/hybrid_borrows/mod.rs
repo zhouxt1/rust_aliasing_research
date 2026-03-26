@@ -31,6 +31,8 @@ impl<'tcx> BorrowerState{
             //     "   Access granted: current borrower {:?} matches access tag {:?}",
             //     self.current_borrower, bor_tag
             // );
+            println!("   Access granted: current borrower {:?} matches access tag {:?}", self.current_borrower, bor_tag);
+
             if let Some(_prev) = self.prev_borrower {
                 self.prev_borrower = None; // Clear previous borrower after successful access
             }
@@ -38,10 +40,12 @@ impl<'tcx> BorrowerState{
             if let Some(prev_tag) = self.prev_borrower {
                 // Handle case where previous borrower exists
                 if prev_tag == bor_tag {
-
+                    println!("   Access granted: previous borrower {:?} matches access tag {:?}", prev_tag, bor_tag);
                 } else {
                     println!("   Access denied: neither current {:?} nor prev borrower {:?} does not match access tag {:?}", self.current_borrower, prev_tag, bor_tag);
                 }
+            } else {
+                println!("   Access denied: neither current {:?} nor prev borrower exists for access tag {:?}", self.current_borrower, bor_tag);
             }
         }
     }
@@ -52,8 +56,8 @@ impl<'tcx> BorrowerState{
         kind: AccessKind,
     ) -> InterpResult<'tcx> {
 
-
         if let ProvenanceExtra::Concrete(bor_tag) = tag {
+            println!("Access with concrete tag {:?}, kind {:?}, and current permission {:?}", bor_tag, kind, self.perms.permission);
             match self.perms.permission {
                 BorrowerPermission::Read => {
                     match kind {
@@ -108,6 +112,7 @@ impl<'tcx> BorrowerState{
             }
         } else {
             // TODO: will handle case where tag is not concrete
+            println!("   Access with non-concrete access tag {:?}", tag);
         }
         interp_ok(())
     }
@@ -179,6 +184,106 @@ impl VisitProvenance for BorrowerState {
 
 impl<'tcx> EvalContextPrivExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
+    fn hb_apply_return_borrowers(
+        &mut self,
+        target_loc: rustc_middle::mir::Location,
+        return_borrowers: crate::ReturnBorrowers,
+    ) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+
+        let mut_locals = return_borrowers.mut_borrows.clone();
+        let two_phase_locals = return_borrowers.two_phase.clone();
+        let dropped_shared_vars = return_borrowers.return_shared_var.clone();
+
+        if let Some(dropped_shared_vars) = dropped_shared_vars {
+            println!(
+                "Found dropped shared reference vars at {:?}: {:?}",
+                target_loc,
+                dropped_shared_vars,
+            );
+            for local in dropped_shared_vars {
+                let src = this.local_to_place(local)?;
+
+                let (alloc_id, _, _tag) = if src.layout.ty.is_ref() {
+                    let imm = this.read_immediate(&src)?;
+                    let mplace = this.ref_to_mplace(&imm)?;
+                    this.ptr_get_alloc_id(mplace.ptr(), 0)?
+                } else {
+                    let mplace = this.force_allocation(&src)?;
+                    this.ptr_get_alloc_id(mplace.ptr(), 0)?
+                };
+
+                if let AllocKind::LiveData = this.get_alloc_info(alloc_id).kind {
+                    let mut borrower_state =
+                        this.get_alloc_extra(alloc_id)?.borrow_tracker_hb().borrow_mut();
+                    if borrower_state.perms.permission == BorrowerPermission::Read {
+                        let shared_borrower_info = borrower_state.shared_borrower.as_mut().unwrap();
+                        shared_borrower_info.1 -= 1;
+                        println!(
+                            "Updated allocation {:?} with {:?} shared refs",
+                            alloc_id,
+                            shared_borrower_info.1
+                        );
+                        if shared_borrower_info.1 == 0 {
+                            borrower_state.perms.permission = BorrowerPermission::Frozen;
+                            println!("Shared borrower for allocation {:?} is now frozen", alloc_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(mut_locals) = mut_locals {
+            println!("Found return mut borrowers at {:?}: {:?}", target_loc, mut_locals);
+
+            for local in mut_locals {
+                let src = this.local_to_place(local)?;
+
+                let (alloc_id, _, tag) = if src.layout.ty.is_ref() {
+                    let imm = this.read_immediate(&src)?;
+                    let mplace = this.ref_to_mplace(&imm)?;
+                    this.ptr_get_alloc_id(mplace.ptr(), 0)?
+                } else {
+                    let mplace = this.force_allocation(&src)?;
+                    this.ptr_get_alloc_id(mplace.ptr(), 0)?
+                };
+
+                if let ProvenanceExtra::Concrete(bor_tag) = tag {
+                    this.hb_return_mut_borrower(alloc_id, bor_tag)?;
+                    println!("Updated allocation {:?} current_borrower to {:?}", alloc_id, bor_tag);
+                }
+            }
+        }
+
+        if let Some(two_phase_locals) = two_phase_locals {
+            println!(
+                "Found return two-phase borrowers at {:?}: {:?}",
+                target_loc,
+                two_phase_locals,
+            );
+
+            for local in two_phase_locals {
+                let src = this.local_to_place(local)?;
+
+                let (alloc_id, _, tag) = if src.layout.ty.is_ref() {
+                    let imm = this.read_immediate(&src)?;
+                    let mplace = this.ref_to_mplace(&imm)?;
+                    this.ptr_get_alloc_id(mplace.ptr(), 0)?
+                } else {
+                    let mplace = this.force_allocation(&src)?;
+                    this.ptr_get_alloc_id(mplace.ptr(), 0)?
+                };
+
+                if let ProvenanceExtra::Concrete(bor_tag) = tag {
+                    this.hb_return_mut_borrower(alloc_id, bor_tag)?;
+                    println!("Updated allocation {:?} current_borrower to {:?}", alloc_id, bor_tag);
+                }
+            }
+        }
+
+        interp_ok(())
+    }
+
     /// Update the borrower state for an allocation with a new tag.
     /// Also tracks the previous borrower for potential conflict detection.
     fn hb_return_mut_borrower(
@@ -253,12 +358,9 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                             // Update new_prov to use the existing shared tag
                             new_prov = Provenance::Concrete { alloc_id, tag: shr_tag };
 
-                            // we need to know if parent prov is from 'current borrower' or from 'shared borrower'
-                            // if it is from a shared borrower, then simply update it
-                            if parent_tag != shr_tag {
-                                // if the parent prov is from shared borrower, then we don't need to increase the count. 
-                                borrower_state.shared_borrower.as_mut().unwrap().1 += 1;
-                            }
+                            // increase the shared-borrower count by 1
+                            borrower_state.shared_borrower.as_mut().unwrap().1 += 1;
+
 
                             println!("Keep allocation {:?} to shared_borrower to {:?}", alloc_id, shr_tag);
                         }
@@ -396,6 +498,150 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 
+    fn hb_before_statement(&mut self) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+
+        let (loc, def_id, pred_block) = {
+            let frame = this.frame();
+            let loc = frame.current_loc();
+            let def_id = frame.instance().def_id();
+            let pred_block = frame.current_pred_block();
+            (loc, def_id, pred_block)
+        };
+
+        let mut selected_return_borrowers = None;
+        if let Some(facts_map) = &this.machine.polonius_facts {
+            if let Some(facts) = facts_map.get(&def_id) {
+                if let Either::Left(target_loc) = loc {
+                    if target_loc.statement_index == 0 {
+                        if let Some(pred_block) = pred_block {
+                            selected_return_borrowers = facts
+                                .predecessor_borrowers
+                                .get(&target_loc.block)
+                                .and_then(|preds| preds.get(&pred_block))
+                                .cloned();
+                            if let Some(return_borrowers) = &selected_return_borrowers {
+                                println!(
+                                    "Selected predecessor path {:?} -> {:?}: {:?}",
+                                    pred_block,
+                                    target_loc.block,
+                                    return_borrowers,
+                                );
+                            }
+                        }
+                    }
+                    if let Some(retags) = facts.retags.get(&target_loc) {
+                        let before_retgs: Vec<_> = retags
+                            .iter()
+                            .filter(|retag| {
+                                retag.timing == crate::RecordedRetagTiming::BeforeInstruction
+                            })
+                            .collect();
+                        if !before_retgs.is_empty() {
+                            println!("Retags before {:?}: {:?}", target_loc, before_retgs);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Either::Left(target_loc) = loc {
+            if let Some(return_borrowers) = selected_return_borrowers {
+                this.hb_apply_return_borrowers(target_loc, return_borrowers)?;
+            }
+        }
+
+        interp_ok(())
+    }
+
+    fn hb_before_terminator(&mut self) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        let frame = this.frame();
+        let loc = frame.current_loc();
+
+        if let Either::Left(target_loc) = loc {
+            let body = &this.body();
+            if let Some(block) = body.basic_blocks.get(target_loc.block) {
+                if let Some(terminator) = &block.terminator {
+                    //println!("Before terminator at {:?}: {:?}", target_loc, terminator);
+
+                    match &terminator.kind {
+                        rustc_middle::mir::TerminatorKind::Call {
+                            func,
+                            ..
+                        } => {
+                            println!(
+                                "Call terminator at {:?}: func={:?}",
+                                target_loc,
+                                func,
+                            );
+                        }       
+                        rustc_middle::mir::TerminatorKind::TailCall { func, args, .. } => {
+                            println!(
+                                "TailCall terminator at {:?}: func={:?}, args={:?}",
+                                target_loc,
+                                func,
+                                args,
+                            );
+                        }
+                        rustc_middle::mir::TerminatorKind::Return => {
+                            println!(
+                                "Return terminator at {:?}: returning from {} into {:?}",
+                                target_loc,
+                                frame.instance(),
+                                frame.return_place,
+                            );
+
+                            // Enforcing it here is very likely wrong. 
+                            if let Some(facts_map) = &this.machine.polonius_facts {
+                                if let Some(facts) = facts_map.get(&frame.instance().def_id()) {
+                                    if let Some(return_borrowers) = facts.return_borrowers.get(&target_loc) {
+                                        if let Some(return_ref_args) = &return_borrowers.return_ref_args {
+                                            let return_ref_args = return_ref_args.clone();
+                                            println!(
+                                                "Reference-typed function arguments at return {:?}: {:?}",
+                                                target_loc,
+                                                return_ref_args,
+                                            );
+                                            // let _ = drop(facts_map); // Explicitly drop to release immutable borrow
+
+                                            // we need to update the current borrower to match return_ref_args.
+                                            // for local in return_ref_args {
+                                            //     let src = this.local_to_place(local)?;
+                                    
+                                            //     // Get the pointer and extract tag for this local
+                                            //     let (alloc_id, _, tag) = if src.layout.ty.is_ref() {
+                                            //         // It's a reference: read it and follow the pointer
+                                            //         let imm = this.read_immediate(&src)?;
+                                            //         let mplace = this.ref_to_mplace(&imm)?;
+                                            //         this.ptr_get_alloc_id(mplace.ptr(), 0)?
+                                            //     } else {
+                                            //         // It's an owned value: force it into allocation
+                                            //         let mplace = this.force_allocation(&src)?;
+                                            //         this.ptr_get_alloc_id(mplace.ptr(), 0)?
+                                            //     };
+                                                
+                                            //     // Update the borrower state with the extracted tag
+                                            //     if let ProvenanceExtra::Concrete(bor_tag) = tag {
+                                                    
+                                            //         this.hb_return_mut_borrower(alloc_id, bor_tag)?;
+                                            //         println!("Updated allocation {:?} current_borrower to {:?}", alloc_id, bor_tag);
+                                            //     }
+                                            // }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        interp_ok(())
+    }
+
     fn hb_after_statement(&mut self) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
@@ -427,104 +673,32 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
 
 
-        // Check for return borrowers at this location
-        let has_facts = this.machine.polonius_facts.is_some();
-        if has_facts {
-            if let Some(facts_map) = &this.machine.polonius_facts {
-                if let Some(facts) = facts_map.get(&def_id) {
-                    // Extract Location from Either (Left = Location, Right = Span)
-                    if let Either::Left(target_loc) = loc {
-                        // print loan live at the current location
-                        //let loc_index = facts.location_table.to_index(target_loc);
-                        if let Some(location_facts) = facts.live_on_entry.get(&target_loc) {
-                            // this is printed for debug only. We don't need to keep track of these in production. 
-                            println!("      Live on entry at {:?}: loans={:?}, origins={:?}, vars={:?}",
-                                target_loc,
-                                location_facts.loans,
-                                location_facts.origins,
-                                location_facts.vars,
-                            );
-                        }
-
-                        if let Some(return_borrowers) = facts.return_borrowers.get(&target_loc) {
-                            // Extract both mut and shared borrowers before processing
-                            let mut_locals = return_borrowers.mut_borrows.clone();
-                            let shared_locals = return_borrowers.shared.clone();
-                            drop(facts_map); // Explicitly drop to release immutable borrow
-                            
-                            // Process mut_borrows
-                            if let Some(mut_locals) = mut_locals {
-                                println!("Found return mut borrowers at {:?}: {:?}", target_loc, mut_locals);
-                                
-                                for local in mut_locals {
-                                    // Convert local to a place and get allocation information
-                                    let src = this.local_to_place(local)?;
-                                    
-                                    // Get the pointer and extract tag for this local
-                                    let (alloc_id, _, tag) = if src.layout.ty.is_ref() {
-                                        // It's a reference: read it and follow the pointer
-                                        let imm = this.read_immediate(&src)?;
-                                        let mplace = this.ref_to_mplace(&imm)?;
-                                        this.ptr_get_alloc_id(mplace.ptr(), 0)?
-                                    } else {
-                                        // It's an owned value: force it into allocation
-                                        let mplace = this.force_allocation(&src)?;
-                                        this.ptr_get_alloc_id(mplace.ptr(), 0)?
-                                    };
-                                    
-                                    // Update the borrower state with the extracted tag
-                                    if let ProvenanceExtra::Concrete(bor_tag) = tag {
-                                        
-                                        this.hb_return_mut_borrower(alloc_id, bor_tag)?;
-                                        println!("Updated allocation {:?} current_borrower to {:?}", alloc_id, bor_tag);
-                                    }
-                                }
-                            }
-                            
-                            // process shared borrows
-                            if let Some(shared_loans) = shared_locals {
-                                println!("Found return shared borrowers at {:?}: {:?}", target_loc, shared_loans);
-
-                                // Question, how does it know if these shared borrows are from the same memory location or not? 
-                                // It probably don't know. So when we likely need to add a counter. Basically, when the counter goes to 0,
-                                // it means that the shared borrow is no longer active and transition to Frozen state. 
-                                for local in shared_loans {
-                                    let src = this.local_to_place(local)?;
-                                    
-                                    // Get the pointer and extract tag for this local
-                                    let (alloc_id, _, tag) = if src.layout.ty.is_ref() {
-                                        // It's a reference: read it and follow the pointer
-                                        let imm = this.read_immediate(&src)?;
-                                        let mplace = this.ref_to_mplace(&imm)?;
-                                        this.ptr_get_alloc_id(mplace.ptr(), 0)?
-                                    } else {
-                                        // It's an owned value: force it into allocation
-                                        let mplace = this.force_allocation(&src)?;
-                                        this.ptr_get_alloc_id(mplace.ptr(), 0)?
-                                    };
-                                    
-                                    if let AllocKind::LiveData = this.get_alloc_info(alloc_id).kind {
-                                        let mut borrower_state = this.get_alloc_extra(alloc_id)?.borrow_tracker_hb().borrow_mut();
-                                        if borrower_state.perms.permission == BorrowerPermission::Read {
-                                            let shared_borrower_info = borrower_state.shared_borrower.as_mut().unwrap();
-                                            shared_borrower_info.1 -= 1;
-                                            println!("Updated allocation {:?} with {:?} shared refs", alloc_id, shared_borrower_info.1);
-                                            if shared_borrower_info.1 == 0 {
-                                                // transition to Frozen state
-                                                borrower_state.perms.permission = BorrowerPermission::Frozen;
-                                                println!("Shared borrower for allocation {:?} is now frozen", alloc_id);
-                                            }
-                                        }
-
-                                    }
-
-                                }
-                            }
-                        }
+        let mut selected_return_borrowers = None;
+        if let Some(facts_map) = &this.machine.polonius_facts {
+            if let Some(facts) = facts_map.get(&def_id) {
+                if let Either::Left(target_loc) = loc {
+                    if let Some(location_facts) = facts.live_on_entry.get(&target_loc) {
+                        println!("      Live on entry at {:?}: loans={:?}, origins={:?}, vars={:?}",
+                            target_loc,
+                            location_facts.loans,
+                            location_facts.origins,
+                            location_facts.vars,
+                        );
                     }
-                } else {
-                    println!("No Polonius facts found for {:?}", def_id);
+
+                    if target_loc.statement_index != 0 {
+                        selected_return_borrowers =
+                            facts.return_borrowers.get(&target_loc).cloned();
+                    }
                 }
+            } else {
+                println!("No Polonius facts found for {:?}", def_id);
+            }
+        }
+
+        if let Either::Left(target_loc) = loc {
+            if let Some(return_borrowers) = selected_return_borrowers {
+                this.hb_apply_return_borrowers(target_loc, return_borrowers)?;
             }
         }
 

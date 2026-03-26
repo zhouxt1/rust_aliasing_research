@@ -382,6 +382,9 @@ pub struct PoloniusFacts<'tcx> {
     // pub output_facts: Output<RustcFacts>,
     pub live_on_entry: FxHashMap<Location, PoloniusLocationFacts>,
     pub return_borrowers: FxHashMap<Location, ReturnBorrowers>,
+    pub predecessor_borrowers:
+        FxHashMap<mir::BasicBlock, FxHashMap<mir::BasicBlock, ReturnBorrowers>>,
+    pub retags: FxHashMap<Location, Vec<RecordedRetag<'tcx>>>,
     pub body: mir::Body<'tcx>,
 }
 
@@ -397,6 +400,21 @@ pub struct ReturnBorrowers {
     pub shared: Option<Vec<Local>>,
     pub mut_borrows: Option<Vec<Local>>,
     pub two_phase: Option<Vec<Local>>,
+    pub return_shared_var: Option<Vec<Local>>,
+    pub return_ref_args: Option<Vec<Local>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordedRetag<'tcx> {
+    pub timing: RecordedRetagTiming,
+    pub kind: mir::RetagKind,
+    pub place: mir::Place<'tcx>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedRetagTiming {
+    BeforeInstruction,
+    AfterCallReturn,
 }
 
 /// Extra per-allocation data
@@ -1821,7 +1839,13 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         // Make sure some time passes.
         ecx.machine.monotonic_clock.tick();
 
+        ecx.before_terminator()?;
+
         interp_ok(())
+    }
+
+    fn before_statement(ecx: &mut InterpCx<'tcx, Self>) -> InterpResult<'tcx> {
+        ecx.before_statement()
     }
 
     fn after_statement(ecx: &mut InterpCx<'tcx, Self>) -> InterpResult<'tcx> {

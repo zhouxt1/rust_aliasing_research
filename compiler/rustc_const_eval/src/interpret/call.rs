@@ -921,6 +921,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             // Follow the unwind edge.
             match stack_pop_info.return_cont {
                 ReturnContinuation::Goto { unwind, .. } => {
+                    self.frame_mut().last_pred = self.frame().loc.left().map(|loc| loc.block);
                     // This must be the very last thing that happens, since it can in fact push a new stack frame.
                     self.unwind_to_block(unwind)
                 }
@@ -931,7 +932,10 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         } else {
             // Follow the normal return edge.
             match stack_pop_info.return_cont {
-                ReturnContinuation::Goto { ret, .. } => self.return_to_block(ret),
+                ReturnContinuation::Goto { ret, .. } => {
+                    self.frame_mut().last_pred = self.frame().loc.left().map(|loc| loc.block);
+                    self.return_to_block(ret)
+                }
                 ReturnContinuation::Stop { .. } => {
                     assert!(
                         self.stack().is_empty(),
