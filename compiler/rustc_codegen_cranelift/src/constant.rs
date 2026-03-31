@@ -615,6 +615,7 @@ pub(crate) fn mir_operand_get_const_val<'tcx>(
                         | StatementKind::StorageDead(_)
                         | StatementKind::Retag(_, _)
                         | StatementKind::AscribeUserType(_, _)
+                        | StatementKind::PoloniusAnchor(_)
                         | StatementKind::PlaceMention(..)
                         | StatementKind::Coverage(_)
                         | StatementKind::ConstEvalCounter

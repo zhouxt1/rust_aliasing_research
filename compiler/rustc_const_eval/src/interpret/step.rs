@@ -13,6 +13,7 @@ use rustc_middle::{bug, mir, span_bug};
 use rustc_span::source_map::Spanned;
 use rustc_target::callconv::FnAbi;
 use tracing::field::Empty;
+use tracing::span::Id;
 use tracing::{info, instrument, trace};
 
 use super::{
@@ -158,6 +159,14 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
 
             // Only used for temporary lifetime lints
             BackwardIncompatibleDropHint { .. } => {}
+            PoloniusAnchor(id) => {
+                let body = self.body();
+                let data = body
+                    .polonius_anchor_data
+                    .get(&id)
+                    .unwrap_or_else(|| bug!("missing Polonius anchor payload for anchor id {id}"));
+                M::handle_polonius_anchor(self, *id, data)?;
+            }
         }
 
         M::after_statement(self)?;
@@ -231,6 +240,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                     } else {
                         mir::RetagKind::Default
                     },
+                    Some(borrow_kind),
                     &val,
                 )?;
                 self.write_immediate(*val, &dest)?;
@@ -252,7 +262,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 if !place_base_raw && !kind.is_fake() {
                     // If this was not already raw, it needs retagging -- except for "fake"
                     // raw borrows whose defining property is that they do not get retagged.
-                    val = M::retag_ptr_value(self, mir::RetagKind::Raw, &val)?;
+                    val = M::retag_ptr_value(self, mir::RetagKind::Raw, None, &val)?;
                 }
                 self.write_immediate(*val, &dest)?;
             }

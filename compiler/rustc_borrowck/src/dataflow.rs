@@ -581,6 +581,7 @@ impl<'tcx> rustc_mir_dataflow::Analysis<'tcx> for Borrows<'_, 'tcx> {
             | mir::StatementKind::Retag { .. }
             | mir::StatementKind::PlaceMention(..)
             | mir::StatementKind::AscribeUserType(..)
+            | mir::StatementKind::PoloniusAnchor(..)
             | mir::StatementKind::Coverage(..)
             | mir::StatementKind::Intrinsic(..)
             | mir::StatementKind::ConstEvalCounter

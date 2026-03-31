@@ -183,6 +183,7 @@ impl<'a, 'tcx> ConstAnalysis<'a, 'tcx> {
             StatementKind::ConstEvalCounter
             | StatementKind::Nop
             | StatementKind::FakeRead(..)
+            | StatementKind::PoloniusAnchor(..)
             | StatementKind::PlaceMention(..)
             | StatementKind::Coverage(..)
             | StatementKind::BackwardIncompatibleDropHint { .. }

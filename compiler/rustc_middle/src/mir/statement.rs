@@ -55,6 +55,7 @@ impl<'tcx> StatementKind<'tcx> {
             StatementKind::Retag(..) => "Retag",
             StatementKind::PlaceMention(..) => "PlaceMention",
             StatementKind::AscribeUserType(..) => "AscribeUserType",
+            StatementKind::PoloniusAnchor(..) => "PoloniusAnchor",
             StatementKind::Coverage(..) => "Coverage",
             StatementKind::Intrinsic(..) => "Intrinsic",
             StatementKind::ConstEvalCounter => "ConstEvalCounter",

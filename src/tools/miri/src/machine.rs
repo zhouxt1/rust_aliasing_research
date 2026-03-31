@@ -42,8 +42,7 @@ use crate::concurrency::{
     AllocDataRaceHandler, GenmcCtx, GenmcEvalContextExt as _, GlobalDataRaceHandler, weak_memory,
 };
 
-use rustc_borrowck::consumers::{BorrowIndex, PoloniusInput, PoloniusRegionVid, RustcFacts};
-use polonius_engine::Output;
+use rustc_borrowck::consumers::{BorrowIndex, PoloniusRegionVid};
 
 use crate::*;
 
@@ -397,6 +396,14 @@ pub struct PoloniusLocationFacts {
 
 #[derive(Debug, Default, Clone)]
 pub struct ReturnBorrowers {
+    // These locals are currently interpreted by `hb_apply_return_borrowers` as the places from
+    // which Miri should recover the tag to reinstall when a loan disappears.
+    //
+    // Important nuance: `compute_return_borrowers` currently stores `borrowed_place.local`
+    // (the base local being borrowed, such as `_1` in `_8 = &mut _1`), not the reference local
+    // that held the expiring loan (such as `_8`). That makes the runtime side recover the tag
+    // from the base allocation after the reborrow has already updated it, which is the key reason
+    // mutable-borrow "returns" can become a no-op.
     pub shared: Option<Vec<Local>>,
     pub mut_borrows: Option<Vec<Local>>,
     pub two_phase: Option<Vec<Local>>,
@@ -1241,12 +1248,16 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         
         if let Some(facts_map) = &ecx.machine.polonius_facts {
             if let Some(facts) = facts_map.get(&func_id) {
+                let body = crate::polonius_pass::prepare_polonius_mir_for_miri(*ecx.tcx, facts);
                 // Allocate the body on the TyCtxt arena to get a &'tcx reference
-                return ecx.tcx.arena.alloc(facts.body.clone());
+                return ecx.tcx.arena.alloc(body);
             }
         }
-        
-        ecx.tcx.instance_mir(instance)
+
+        match instance {
+            ty::InstanceKind::Item(def) => ecx.tcx.mir_for_ctfe(def),
+            _ => ecx.tcx.instance_mir(instance),
+        }
     }
 
     fn check_fn_target_features(
@@ -1720,10 +1731,11 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
     fn retag_ptr_value(
         ecx: &mut InterpCx<'tcx, Self>,
         kind: mir::RetagKind,
+        borrow_kind: Option<mir::BorrowKind>,
         val: &ImmTy<'tcx>,
     ) -> InterpResult<'tcx, ImmTy<'tcx>> {
         if ecx.machine.borrow_tracker.is_some() {
-            ecx.retag_ptr_value(kind, val)
+            ecx.retag_ptr_value(kind, borrow_kind, val)
         } else {
             interp_ok(val.clone())
         }
@@ -1846,6 +1858,14 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
 
     fn before_statement(ecx: &mut InterpCx<'tcx, Self>) -> InterpResult<'tcx> {
         ecx.before_statement()
+    }
+
+    fn handle_polonius_anchor(
+        ecx: &mut InterpCx<'tcx, Self>,
+        id: mir::PoloniusAnchorId,
+        data: &mir::PoloniusAnchorData,
+    ) -> InterpResult<'tcx> {
+        ecx.handle_polonius_anchor(id, data)
     }
 
     fn after_statement(ecx: &mut InterpCx<'tcx, Self>) -> InterpResult<'tcx> {

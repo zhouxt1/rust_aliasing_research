@@ -1762,6 +1762,7 @@ impl<'tcx> Visitor<'tcx> for EnsureCoroutineFieldAssignmentsNeverAlias<'_> {
             | StatementKind::PlaceMention(..)
             | StatementKind::Coverage(..)
             | StatementKind::Intrinsic(..)
+            | StatementKind::PoloniusAnchor(..)
             | StatementKind::ConstEvalCounter
             | StatementKind::BackwardIncompatibleDropHint { .. }
             | StatementKind::Nop => {}

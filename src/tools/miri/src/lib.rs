@@ -66,6 +66,7 @@ extern crate rustc_hir;
 extern crate rustc_index;
 extern crate rustc_log;
 extern crate rustc_middle;
+extern crate rustc_mir_transform;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_symbol_mangling;
@@ -75,7 +76,6 @@ extern crate rustc_target;
 #[allow(unused_extern_crates)]
 extern crate rustc_driver;
 extern crate rustc_borrowck;
-extern crate polonius_engine;
 
 mod alloc;
 mod alloc_addresses;
@@ -90,6 +90,7 @@ mod intrinsics;
 mod machine;
 mod math;
 mod operator;
+mod polonius_pass;
 mod provenance_gc;
 mod shims;
 

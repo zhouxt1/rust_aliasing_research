@@ -832,6 +832,7 @@ impl Debug for Statement<'_> {
             AscribeUserType(box (ref place, ref c_ty), ref variance) => {
                 write!(fmt, "AscribeUserType({place:?}, {variance:?}, {c_ty:?})")
             }
+            PoloniusAnchor(id) => write!(fmt, "PoloniusAnchor({id})"),
             Coverage(ref kind) => write!(fmt, "Coverage::{kind:?}"),
             Intrinsic(box ref intrinsic) => write!(fmt, "{intrinsic}"),
             ConstEvalCounter => write!(fmt, "ConstEvalCounter"),

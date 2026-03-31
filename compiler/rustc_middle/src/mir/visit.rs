@@ -477,6 +477,7 @@ macro_rules! make_mir_visitor {
                             location
                         );
                     }
+                    StatementKind::PoloniusAnchor(..) => {}
                     StatementKind::Coverage(coverage) => {
                         self.visit_coverage(
                             coverage,

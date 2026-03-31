@@ -717,6 +717,7 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                     | StatementKind::Intrinsic(_)
                     | StatementKind::Nop
                     | StatementKind::FakeRead(_)
+                    | StatementKind::PoloniusAnchor(..)
                     | StatementKind::PlaceMention(_)
                     | StatementKind::ConstEvalCounter
                     | StatementKind::BackwardIncompatibleDropHint { .. }

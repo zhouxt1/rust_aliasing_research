@@ -420,6 +420,7 @@ impl<'a, 'tcx, F: Fn(Ty<'tcx>) -> bool> MoveDataBuilder<'a, 'tcx, F> {
             }
             StatementKind::Retag { .. }
             | StatementKind::AscribeUserType(..)
+            | StatementKind::PoloniusAnchor(..)
             | StatementKind::PlaceMention(..)
             | StatementKind::Coverage(..)
             | StatementKind::Intrinsic(..)

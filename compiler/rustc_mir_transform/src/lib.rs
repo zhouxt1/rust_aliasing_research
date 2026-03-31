@@ -51,7 +51,7 @@ mod ffi_unwind_calls;
 mod lint;
 mod lint_tail_expr_drop_order;
 mod liveness;
-mod patch;
+pub mod patch;
 mod shim;
 mod ssa;
 mod trivial_const;

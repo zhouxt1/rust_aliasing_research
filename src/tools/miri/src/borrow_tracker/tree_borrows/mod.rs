@@ -427,6 +427,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn tb_retag_ptr_value(
         &mut self,
         kind: RetagKind,
+        _borrow_kind: Option<rustc_middle::mir::BorrowKind>,
         val: &ImmTy<'tcx>,
     ) -> InterpResult<'tcx, ImmTy<'tcx>> {
         let this = self.eval_context_mut();

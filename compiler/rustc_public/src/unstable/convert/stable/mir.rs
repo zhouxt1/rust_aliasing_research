@@ -176,6 +176,7 @@ impl<'tcx> Stable<'tcx> for mir::StatementKind<'tcx> {
             mir::StatementKind::Intrinsic(intrinstic) => {
                 crate::mir::StatementKind::Intrinsic(intrinstic.stable(tables, cx))
             }
+            mir::StatementKind::PoloniusAnchor(..) => crate::mir::StatementKind::Nop,
             mir::StatementKind::ConstEvalCounter => crate::mir::StatementKind::ConstEvalCounter,
             // BackwardIncompatibleDropHint has no semantics, so it is translated to Nop.
             mir::StatementKind::BackwardIncompatibleDropHint { .. } => {

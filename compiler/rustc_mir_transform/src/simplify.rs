@@ -577,6 +577,7 @@ impl<'tcx> Visitor<'tcx> for UsedLocals {
             }
 
             StatementKind::ConstEvalCounter
+            | StatementKind::PoloniusAnchor(..)
             | StatementKind::Nop
             | StatementKind::StorageLive(..)
             | StatementKind::StorageDead(..) => {}

@@ -91,6 +91,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             mir::StatementKind::FakeRead(..)
             | mir::StatementKind::Retag { .. }
             | mir::StatementKind::AscribeUserType(..)
+            | mir::StatementKind::PoloniusAnchor(..)
             | mir::StatementKind::ConstEvalCounter
             | mir::StatementKind::PlaceMention(..)
             | mir::StatementKind::BackwardIncompatibleDropHint { .. }

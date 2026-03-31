@@ -67,6 +67,19 @@ pub use self::pretty::{MirDumper, PassWhere, display_allocation, write_mir_prett
 
 /// Types for locals
 pub type LocalDecls<'tcx> = IndexSlice<Local, LocalDecl<'tcx>>;
+pub type PoloniusAnchorId = u32;
+
+#[derive(Clone, TyEncodable, TyDecodable, Debug, PartialEq, Eq, Hash, HashStable)]
+pub enum PoloniusAnchorKind {
+    MutReturnBorrower { locals: Vec<Local> },
+    SharedReturnVar { locals: Vec<Local> },
+    TwoPhaseReturnBorrower { locals: Vec<Local> },
+}
+
+#[derive(Clone, TyEncodable, TyDecodable, Debug, PartialEq, Eq, Hash, HashStable)]
+pub struct PoloniusAnchorData {
+    pub kind: PoloniusAnchorKind,
+}
 
 pub trait HasLocalDecls<'tcx> {
     fn local_decls(&self) -> &LocalDecls<'tcx>;
@@ -332,6 +345,12 @@ pub struct Body<'tcx> {
     #[type_foldable(identity)]
     #[type_visitable(ignore)]
     pub function_coverage_info: Option<Box<coverage::FunctionCoverageInfo>>,
+
+    /// Out-of-band payload for [`StatementKind::PoloniusAnchor`] markers carried by this body.
+    #[stable_hasher(ignore)]
+    #[type_foldable(identity)]
+    #[type_visitable(ignore)]
+    pub polonius_anchor_data: FxHashMap<PoloniusAnchorId, PoloniusAnchorData>,
 }
 
 impl<'tcx> Body<'tcx> {
@@ -375,6 +394,7 @@ impl<'tcx> Body<'tcx> {
             tainted_by_errors,
             coverage_info_hi: None,
             function_coverage_info: None,
+            polonius_anchor_data: FxHashMap::default(),
         };
         body.is_polymorphic = body.has_non_region_param();
         body
@@ -406,6 +426,7 @@ impl<'tcx> Body<'tcx> {
             tainted_by_errors: None,
             coverage_info_hi: None,
             function_coverage_info: None,
+            polonius_anchor_data: FxHashMap::default(),
         };
         body.is_polymorphic = body.has_non_region_param();
         body

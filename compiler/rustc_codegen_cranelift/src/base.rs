@@ -910,6 +910,7 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
         | StatementKind::ConstEvalCounter
         | StatementKind::Nop
         | StatementKind::FakeRead(..)
+        | StatementKind::PoloniusAnchor(..)
         | StatementKind::Retag { .. }
         | StatementKind::PlaceMention(..)
         | StatementKind::BackwardIncompatibleDropHint { .. }

@@ -730,6 +730,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
             | StatementKind::Retag { .. }
             | StatementKind::PlaceMention(..)
             | StatementKind::AscribeUserType(..)
+            | StatementKind::PoloniusAnchor(..)
             | StatementKind::Coverage(..)
             | StatementKind::Intrinsic(..)
             | StatementKind::ConstEvalCounter

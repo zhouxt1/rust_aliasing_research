@@ -164,6 +164,7 @@ impl<'tcx> Analysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
             // Nothing to do for these. Match exhaustively so this fails to compile when new
             // variants are added.
             StatementKind::AscribeUserType(..)
+            | StatementKind::PoloniusAnchor(..)
             | StatementKind::PlaceMention(..)
             | StatementKind::Coverage(..)
             | StatementKind::FakeRead(..)

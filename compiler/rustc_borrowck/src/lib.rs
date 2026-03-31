@@ -835,6 +835,7 @@ impl<'a, 'tcx> ResultsVisitor<'tcx, Borrowck<'a, 'tcx>> for MirBorrowckCtxt<'a, 
             | StatementKind::PlaceMention(..)
             // Doesn't have any language semantics
             | StatementKind::Coverage(..)
+            | StatementKind::PoloniusAnchor(..)
             // These do not actually affect borrowck
             | StatementKind::ConstEvalCounter
             | StatementKind::StorageLive(..) => {}

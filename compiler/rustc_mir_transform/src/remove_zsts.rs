@@ -130,7 +130,8 @@ impl<'tcx> MutVisitor<'tcx> for Replacer<'_, 'tcx> {
             StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
                 Some(local.into())
             }
-            StatementKind::Coverage(_)
+            StatementKind::PoloniusAnchor(_)
+            | StatementKind::Coverage(_)
             | StatementKind::Intrinsic(_)
             | StatementKind::Nop
             | StatementKind::BackwardIncompatibleDropHint { .. }

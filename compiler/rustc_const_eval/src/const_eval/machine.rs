@@ -794,6 +794,7 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
     fn retag_ptr_value(
         ecx: &mut InterpCx<'tcx, Self>,
         _kind: mir::RetagKind,
+        _borrow_kind: Option<mir::BorrowKind>,
         val: &ImmTy<'tcx, CtfeProvenance>,
     ) -> InterpResult<'tcx, ImmTy<'tcx, CtfeProvenance>> {
         // If it's a frozen shared reference that's not already immutable, potentially make it immutable.

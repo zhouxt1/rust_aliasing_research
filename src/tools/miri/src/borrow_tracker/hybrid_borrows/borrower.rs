@@ -1,5 +1,4 @@
-
-use crate::borrow_tracker::{BorTag};
+use crate::borrow_tracker::BorTag;
 
 #[derive(Debug, Clone)]
 pub struct BorrowerState {
@@ -13,7 +12,7 @@ pub struct BorrowerState {
 
 #[derive(Debug, Clone)]
 pub struct LocationState {
-    pub permission : BorrowerPermission,
+    pub permission: BorrowerPermission,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,10 +20,17 @@ pub enum BorrowerPermission {
     Read,
     Write,
     Frozen,
+    Reserved,
 }
 
 impl BorrowerState {
     pub fn new(current_borrower: BorTag) -> Self {
-        BorrowerState { current_borrower, prev_borrower: None, shared_borrower: None, exposed_stack: None, perms: LocationState { permission: BorrowerPermission::Write } }
+        BorrowerState {
+            current_borrower,
+            prev_borrower: None,
+            shared_borrower: None,
+            exposed_stack: None,
+            perms: LocationState { permission: BorrowerPermission::Write },
+        }
     }
 }

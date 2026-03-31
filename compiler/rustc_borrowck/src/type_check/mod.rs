@@ -704,6 +704,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
             | StatementKind::StorageLive(..)
             | StatementKind::StorageDead(..)
             | StatementKind::Retag { .. }
+            | StatementKind::PoloniusAnchor(..)
             | StatementKind::Coverage(..)
             | StatementKind::ConstEvalCounter
             | StatementKind::PlaceMention(..)

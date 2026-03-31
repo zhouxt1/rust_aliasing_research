@@ -21,6 +21,8 @@ use crate::mir::coverage::CoverageKind;
 use crate::ty::adjustment::PointerCoercion;
 use crate::ty::{self, GenericArgsRef, List, Region, Ty, UserTypeAnnotationIndex};
 
+use crate::mir::PoloniusAnchorId;
+
 /// Represents the "flavors" of MIR.
 ///
 /// The MIR pipeline is structured into a few major dialects, with one or more phases within each
@@ -425,6 +427,16 @@ pub enum StatementKind<'tcx> {
     ///
     /// Disallowed after drop elaboration.
     AscribeUserType(Box<(Place<'tcx>, UserTypeProjection)>, ty::Variance),
+
+    /// Marker inserted by Polonius-aware consumers to attach stable semantic anchors to MIR.
+    ///
+    /// This is semantically a no-op. The associated payload is stored in
+    /// [`mir::Body::polonius_anchor_data`](crate::mir::Body::polonius_anchor_data).
+    PoloniusAnchor(
+        #[type_foldable(identity)]
+        #[type_visitable(ignore)]
+        PoloniusAnchorId,
+    ),
 
     /// Carries control-flow-sensitive information injected by `-Cinstrument-coverage`,
     /// such as where to generate physical coverage-counter-increments during codegen.

@@ -4,7 +4,7 @@ use std::num::NonZero;
 
 use rustc_abi::Size;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_middle::mir::RetagKind;
+use rustc_middle::mir::{BorrowKind, RetagKind, PoloniusAnchorData, PoloniusAnchorId, PoloniusAnchorKind};
 use smallvec::SmallVec;
 
 use crate::*;
@@ -274,15 +274,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn retag_ptr_value(
         &mut self,
         kind: RetagKind,
+        borrow_kind: Option<BorrowKind>,
         val: &ImmTy<'tcx>,
     ) -> InterpResult<'tcx, ImmTy<'tcx>> {
         let _trace = enter_trace_span!(borrow_tracker::retag_ptr_value, ?kind, ?val.layout);
         let this = self.eval_context_mut();
         let method = this.machine.borrow_tracker.as_ref().unwrap().borrow().borrow_tracker_method;
         match method {
-            BorrowTrackerMethod::StackedBorrows => this.sb_retag_ptr_value(kind, val),
-            BorrowTrackerMethod::TreeBorrows { .. } => this.tb_retag_ptr_value(kind, val),            BorrowTrackerMethod::HybridBorrows => this.hb_retag_ptr_value(kind, val),
-            BorrowTrackerMethod::HybridBorrows => this.hb_retag_ptr_value(kind, val),
+            BorrowTrackerMethod::StackedBorrows => this.sb_retag_ptr_value(kind, borrow_kind, val),
+            BorrowTrackerMethod::TreeBorrows { .. } => this.tb_retag_ptr_value(kind, borrow_kind, val),
+            BorrowTrackerMethod::HybridBorrows => this.hb_retag_ptr_value(kind, borrow_kind, val),
         }
     }
 
@@ -366,6 +367,22 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let method = borrow_tracker.borrow().borrow_tracker_method;
         match method {
             BorrowTrackerMethod::HybridBorrows => this.hb_before_statement(),
+            _ => interp_ok(()),
+        }
+    }
+
+    fn handle_polonius_anchor(
+        &mut self,
+        id: PoloniusAnchorId,
+        data: &PoloniusAnchorData,
+    ) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        let Some(borrow_tracker) = &this.machine.borrow_tracker else {
+            return interp_ok(());
+        };
+        let method = borrow_tracker.borrow().borrow_tracker_method;
+        match method {
+            BorrowTrackerMethod::HybridBorrows => this.hb_handle_polonius_anchor(id, data),
             _ => interp_ok(()),
         }
     }

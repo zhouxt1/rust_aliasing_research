@@ -58,7 +58,7 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateDrops {
         // init/uninit for types that do need dropping.
         let move_data = MoveData::gather_moves(body, tcx, |ty| ty.needs_drop(tcx, typing_env));
         let elaborate_patch = {
-            let env = MoveDataTypingEnv { move_data, typing_env };
+            let env: MoveDataTypingEnv<'_> = MoveDataTypingEnv { move_data, typing_env };
 
             let mut inits = MaybeInitializedPlaces::new(tcx, body, &env.move_data)
                 .exclude_inactive_in_otherwise()

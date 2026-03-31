@@ -402,6 +402,7 @@ impl<'a, 'tcx> TOFinder<'a, 'tcx> {
             | StatementKind::AscribeUserType(..)
             | StatementKind::Coverage(..)
             | StatementKind::FakeRead(..)
+            | StatementKind::PoloniusAnchor(..)
             | StatementKind::ConstEvalCounter
             | StatementKind::PlaceMention(..)
             | StatementKind::BackwardIncompatibleDropHint { .. }

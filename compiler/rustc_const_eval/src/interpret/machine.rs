@@ -319,6 +319,15 @@ pub trait Machine<'tcx>: Sized {
         interp_ok(())
     }
 
+    #[inline]
+    fn handle_polonius_anchor(
+        _ecx: &mut InterpCx<'tcx, Self>,
+        _id: mir::PoloniusAnchorId,
+        _data: &mir::PoloniusAnchorData,
+    ) -> InterpResult<'tcx> {
+        interp_ok(())
+    }
+
     /// Called before a global allocation is accessed.
     /// `def_id` is `Some` if this is the "lazy" allocation of a static.
     #[inline]
@@ -494,6 +503,7 @@ pub trait Machine<'tcx>: Sized {
     fn retag_ptr_value(
         _ecx: &mut InterpCx<'tcx, Self>,
         _kind: mir::RetagKind,
+        _borrow_kind: Option<mir::BorrowKind>,
         val: &ImmTy<'tcx, Self::Provenance>,
     ) -> InterpResult<'tcx, ImmTy<'tcx, Self::Provenance>> {
         interp_ok(val.clone())

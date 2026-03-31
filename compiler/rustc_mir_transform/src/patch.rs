@@ -9,7 +9,7 @@ use tracing::debug;
 /// various changes, such as the addition of new statements and basic blocks
 /// and replacement of terminators, and then apply the queued changes all at
 /// once with `apply`. This is useful for MIR transformation passes.
-pub(crate) struct MirPatch<'tcx> {
+pub struct MirPatch<'tcx> {
     term_patch_map: FxHashMap<BasicBlock, TerminatorKind<'tcx>>,
     /// Set of statements that should be replaced by `Nop`.
     nop_statements: Vec<Location>,
@@ -34,7 +34,7 @@ pub(crate) struct MirPatch<'tcx> {
 
 impl<'tcx> MirPatch<'tcx> {
     /// Creates a new, empty patch.
-    pub(crate) fn new(body: &Body<'tcx>) -> Self {
+    pub fn new(body: &Body<'tcx>) -> Self {
         let mut result = MirPatch {
             term_patch_map: Default::default(),
             nop_statements: vec![],
@@ -83,7 +83,7 @@ impl<'tcx> MirPatch<'tcx> {
         result
     }
 
-    pub(crate) fn resume_block(&mut self) -> BasicBlock {
+    pub fn resume_block(&mut self) -> BasicBlock {
         if let Some(bb) = self.resume_block {
             return bb;
         }
@@ -99,7 +99,7 @@ impl<'tcx> MirPatch<'tcx> {
         bb
     }
 
-    pub(crate) fn unreachable_cleanup_block(&mut self) -> BasicBlock {
+    pub fn unreachable_cleanup_block(&mut self) -> BasicBlock {
         if let Some(bb) = self.unreachable_cleanup_block {
             return bb;
         }
@@ -115,7 +115,7 @@ impl<'tcx> MirPatch<'tcx> {
         bb
     }
 
-    pub(crate) fn unreachable_no_cleanup_block(&mut self) -> BasicBlock {
+    pub fn unreachable_no_cleanup_block(&mut self) -> BasicBlock {
         if let Some(bb) = self.unreachable_no_cleanup_block {
             return bb;
         }
@@ -131,7 +131,7 @@ impl<'tcx> MirPatch<'tcx> {
         bb
     }
 
-    pub(crate) fn terminate_block(&mut self, reason: UnwindTerminateReason) -> BasicBlock {
+    pub fn terminate_block(&mut self, reason: UnwindTerminateReason) -> BasicBlock {
         if let Some((cached_bb, cached_reason)) = self.terminate_block
             && reason == cached_reason
         {
@@ -150,12 +150,12 @@ impl<'tcx> MirPatch<'tcx> {
     }
 
     /// Has a replacement of this block's terminator been queued in this patch?
-    pub(crate) fn is_term_patched(&self, bb: BasicBlock) -> bool {
+    pub fn is_term_patched(&self, bb: BasicBlock) -> bool {
         self.term_patch_map.contains_key(&bb)
     }
 
     /// Universal getter for block data, either it is in 'old' blocks or in patched ones
-    pub(crate) fn block<'a>(
+    pub fn block<'a>(
         &'a self,
         body: &'a Body<'tcx>,
         bb: BasicBlock,
@@ -166,13 +166,13 @@ impl<'tcx> MirPatch<'tcx> {
         }
     }
 
-    pub(crate) fn terminator_loc(&self, body: &Body<'tcx>, bb: BasicBlock) -> Location {
+    pub fn terminator_loc(&self, body: &Body<'tcx>, bb: BasicBlock) -> Location {
         let offset = self.block(body, bb).statements.len();
         Location { block: bb, statement_index: offset }
     }
 
     /// Queues the addition of a new temporary with additional local info.
-    pub(crate) fn new_local_with_info(
+    pub fn new_local_with_info(
         &mut self,
         ty: Ty<'tcx>,
         span: Span,
@@ -186,14 +186,14 @@ impl<'tcx> MirPatch<'tcx> {
     }
 
     /// Queues the addition of a new temporary.
-    pub(crate) fn new_temp(&mut self, ty: Ty<'tcx>, span: Span) -> Local {
+    pub fn new_temp(&mut self, ty: Ty<'tcx>, span: Span) -> Local {
         let index = self.next_local + self.new_locals.len();
         self.new_locals.push(LocalDecl::new(ty, span));
         Local::new(index)
     }
 
     /// Returns the type of a local that's newly-added in the patch.
-    pub(crate) fn local_ty(&self, local: Local) -> Ty<'tcx> {
+    pub fn local_ty(&self, local: Local) -> Ty<'tcx> {
         let local = local.as_usize();
         assert!(local < self.next_local + self.new_locals.len());
         let new_local_idx = local - self.next_local;
@@ -201,7 +201,7 @@ impl<'tcx> MirPatch<'tcx> {
     }
 
     /// Queues the addition of a new basic block.
-    pub(crate) fn new_block(&mut self, data: BasicBlockData<'tcx>) -> BasicBlock {
+    pub fn new_block(&mut self, data: BasicBlockData<'tcx>) -> BasicBlock {
         let block = BasicBlock::from_usize(self.next_block + self.new_blocks.len());
         debug!("MirPatch: new_block: {:?}: {:?}", block, data);
         self.new_blocks.push(data);
@@ -209,7 +209,7 @@ impl<'tcx> MirPatch<'tcx> {
     }
 
     /// Queues the replacement of a block's terminator.
-    pub(crate) fn patch_terminator(&mut self, block: BasicBlock, new: TerminatorKind<'tcx>) {
+    pub fn patch_terminator(&mut self, block: BasicBlock, new: TerminatorKind<'tcx>) {
         assert!(!self.term_patch_map.contains_key(&block));
         debug!("MirPatch: patch_terminator({:?}, {:?})", block, new);
         self.term_patch_map.insert(block, new);
@@ -220,7 +220,7 @@ impl<'tcx> MirPatch<'tcx> {
     /// This method only works on statements from the initial body, and cannot be used to remove
     /// statements from `add_statement` or `add_assign`.
     #[tracing::instrument(level = "debug", skip(self))]
-    pub(crate) fn nop_statement(&mut self, loc: Location) {
+    pub fn nop_statement(&mut self, loc: Location) {
         self.nop_statements.push(loc);
     }
 
@@ -237,18 +237,18 @@ impl<'tcx> MirPatch<'tcx> {
     ///   p.apply(body);
     ///
     /// then the final order will be `s1, s2, s0`, with `s1` at `loc`.
-    pub(crate) fn add_statement(&mut self, loc: Location, stmt: StatementKind<'tcx>) {
+    pub fn add_statement(&mut self, loc: Location, stmt: StatementKind<'tcx>) {
         debug!("MirPatch: add_statement({:?}, {:?})", loc, stmt);
         self.new_statements.push((loc, stmt));
     }
 
     /// Like `add_statement`, but specialized for assignments.
-    pub(crate) fn add_assign(&mut self, loc: Location, place: Place<'tcx>, rv: Rvalue<'tcx>) {
+    pub fn add_assign(&mut self, loc: Location, place: Place<'tcx>, rv: Rvalue<'tcx>) {
         self.add_statement(loc, StatementKind::Assign(Box::new((place, rv))));
     }
 
     /// Applies the queued changes.
-    pub(crate) fn apply(self, body: &mut Body<'tcx>) {
+    pub fn apply(self, body: &mut Body<'tcx>) {
         debug!(
             "MirPatch: {:?} new temps, starting from index {}: {:?}",
             self.new_locals.len(),
@@ -314,7 +314,7 @@ impl<'tcx> MirPatch<'tcx> {
         }
     }
 
-    pub(crate) fn source_info_for_location(&self, body: &Body<'tcx>, loc: Location) -> SourceInfo {
+    pub fn source_info_for_location(&self, body: &Body<'tcx>, loc: Location) -> SourceInfo {
         let data = self.block(body, loc.block);
         Self::source_info_for_index(data, loc)
     }

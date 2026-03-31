@@ -95,6 +95,7 @@ impl RemoveNoopLandingPads {
                 | StatementKind::StorageDead(_)
                 | StatementKind::PlaceMention(..)
                 | StatementKind::AscribeUserType(..)
+                | StatementKind::PoloniusAnchor(..)
                 | StatementKind::Coverage(..)
                 | StatementKind::ConstEvalCounter
                 | StatementKind::BackwardIncompatibleDropHint { .. }

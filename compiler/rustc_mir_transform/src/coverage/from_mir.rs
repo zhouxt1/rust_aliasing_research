@@ -60,6 +60,7 @@ fn filtered_statement_span(statement: &Statement<'_>) -> Option<Span> {
         // for their parent `BasicBlock`.
         StatementKind::StorageLive(_)
         | StatementKind::StorageDead(_)
+        | StatementKind::PoloniusAnchor(_)
         | StatementKind::ConstEvalCounter
         | StatementKind::BackwardIncompatibleDropHint { .. }
         | StatementKind::Nop => None,

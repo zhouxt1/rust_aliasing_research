@@ -475,6 +475,16 @@ fn compute_return_borrowers<'tcx>(
                             }
                         }
                         if !is_region_dead {
+                            // Semantic mismatch to keep in mind:
+                            // this pushes the base local that was borrowed, not the local that
+                            // stored the reference carrying `loan`.
+                            //
+                            // For `_8 = &mut _1`, we therefore return `_1`. Later,
+                            // `hb_apply_return_borrowers` extracts a tag from `_1`, but `_1`'s
+                            // allocation already carries the newest borrower tag that was written
+                            // when `_8` was created. As a result, the "return borrower" update
+                            // often reinstalls the same current tag instead of restoring the
+                            // previous borrower.
                             locals.push(borrowed_place.local);
                         }
                     }
@@ -485,57 +495,16 @@ fn compute_return_borrowers<'tcx>(
 
     let mut result_map = FxHashMap::default();
 
-
     for (i, block) in body.basic_blocks.iter().enumerate() {
         let num_stmts = block.statements.len();
-        for j in 0..=num_stmts {
+        for j in 0..num_stmts {
             let loc = Location { block: rustc_middle::mir::BasicBlock::from_usize(i), statement_index: j };
             let mut return_borrowers = miri::ReturnBorrowers::default();
 
             let check_loans = |loans_map: &FxHashMap<Location, Vec<BorrowIndex>>| -> Vec<Local> {
                 let next_loc = Location { block: loc.block, statement_index: j + 1 };
                 // We can just ignore the other case. Because we already consider the case of a terminator by including the predecessors. 
-                // } else {
-                //     // Preserve the existing union-of-successors behavior for the flat
-                //     // per-location map. The edge-specific map below refines this by predecessor.
-                //     let next_loans_alive = get_successor_loans(block.terminator(), loans_map);
-                //     let loans_alive = loans_map.get(&loc).map(|v| v.as_slice()).unwrap_or(&[]);
-                //     let dropped = loans_alive.iter().filter(|l| !next_loans_alive.contains(l));
-                //     let mut locals = Vec::new();
-                //     for &loan in dropped {
-                //         if let Some(borrowed_place) = borrow_issuer_map.get(&loan) {
-                //             let killed = loan_killed_at_map.get(&loan).map_or(false, |k| {
-                //                 k.contains(&location_table.mid_index(loc))
-                //             });
-                //             if !killed {
-                //                 let local_decl =
-                //                     &body_with_facts.body.local_decls[borrowed_place.local];
-                //                 let mut is_region_dead = false;
-                //                 if let rustc_middle::ty::TyKind::Ref(region, _, _) =
-                //                     local_decl.ty.kind()
-                //                 {
-                //                     if let rustc_middle::ty::RegionKind::ReVar(vid) = region.kind()
-                //                     {
-                //                         if let Some(location_facts) = live_on_entry.get(&loc) {
-                //                             if !location_facts
-                //                                 .origins
-                //                                 .contains(&PoloniusRegionVid::from(vid))
-                //                             {
-                //                                 is_region_dead = true;
-                //                             }
-                //                         } else {
-                //                             is_region_dead = true;
-                //                         }
-                //                     }
-                //                 }
-                //                 if !is_region_dead {
-                //                     locals.push(borrowed_place.local);
-                //                 }
-                //             }
-                //         }
-                //     }
-                //     return locals;
-                // };
+
                 check_loans_between(loc, next_loc, loans_map)
             };
 
@@ -709,6 +678,12 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
                         let output = polonius_engine::Output::compute(input_facts, algorithm, true);
                         let (return_borrows, live_on_entry, predecessor_borrowers) =
                             compute_return_borrowers(body_with_facts, &output);
+                        // println!(
+                        //     "compute_return_borrowers: def_id={:?}, return_borrowers={:#?}",
+                        //     def_id.to_def_id(),
+                        //     return_borrows
+                        // );
+
                         let retags = compute_retags(tcx, &body_with_facts.body);
 
                         facts_map.insert(def_id.to_def_id(), miri::PoloniusFacts {
