@@ -249,6 +249,7 @@ fn check_statement<'tcx>(
         | StatementKind::ConstEvalCounter
         | StatementKind::BackwardIncompatibleDropHint { .. }
         | StatementKind::Nop => Ok(()),
+        _ => Ok(())
     }
 }
 
