@@ -257,11 +257,36 @@ pub fn get_target_dir(meta: &Metadata) -> PathBuf {
 
 /// Determines where the sysroot of this execution is
 ///
-/// Either in a user-specified spot by an envar, or in a default cache location.
+/// If `MIRI_SYSROOT` is set, that path is used directly.
+///
+/// Otherwise, we try to detect whether `cargo-miri` was built as part of a
+/// local Rust compiler fork (e.g. a research checkout) by walking up from the
+/// current executable's location to find a `.git` directory.  If found, the
+/// sysroot is stored at `<project_root>/build/miri-sysroot`, keeping all build
+/// artefacts self-contained within the repository.
+///
+/// If no such project root is found (e.g. a system-installed `cargo-miri`),
+/// we fall back to the per-user OS cache directory as before.
 pub fn get_sysroot_dir() -> PathBuf {
     match std::env::var_os("MIRI_SYSROOT") {
         Some(dir) => PathBuf::from(dir),
         None => {
+            // Walk up from the binary's location looking for a .git directory that
+            // marks the root of a local compiler/tool checkout.
+            if let Ok(exe) = std::env::current_exe() {
+                let mut dir = exe;
+                dir.pop(); // remove the binary filename
+                // `PathBuf::pop` returns false when we've reached the root.
+                loop {
+                    if dir.join(".git").exists() {
+                        return dir.join("build").join("miri-sysroot");
+                    }
+                    if !dir.pop() {
+                        break;
+                    }
+                }
+            }
+            // Fallback: global OS cache (used by system-installed Miri).
             let user_dirs = directories::ProjectDirs::from("org", "rust-lang", "miri").unwrap();
             user_dirs.cache_dir().to_owned()
         }

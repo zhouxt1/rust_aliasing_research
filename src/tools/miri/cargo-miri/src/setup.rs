@@ -2,6 +2,7 @@
 
 use std::env;
 use std::ffi::OsStr;
+use std::fs;
 use std::path::PathBuf;
 use std::process::{self, Command};
 
@@ -86,6 +87,8 @@ pub fn setup(
             std_features: ["panic-unwind", "backtrace"].into_iter().map(Into::into).collect(),
         }
     };
+    let force_sysroot_rebuild = std::env::var_os("MIRI_FORCE_SYSROOT_REBUILD")
+        .is_some_and(|val| val != "0");
     let cargo_cmd = {
         let mut command = cargo();
         // Use Miri as rustc to build a libstd compatible with us (and use the right flags).
@@ -157,6 +160,18 @@ pub fn setup(
             }
         }
     };
+
+    if force_sysroot_rebuild {
+        match fs::remove_dir_all(&sysroot_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => show_error!(
+                "failed to remove existing Miri sysroot `{}`: {}",
+                sysroot_dir.display(),
+                err
+            ),
+        }
+    }
 
     // Do the build.
     let status = SysrootBuilder::new(&sysroot_dir, target)

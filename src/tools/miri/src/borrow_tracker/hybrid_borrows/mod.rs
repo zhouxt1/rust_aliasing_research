@@ -15,6 +15,7 @@ pub use self::borrower::{BorrowerPermission, BorrowerState, RawPointerStack};
 
 // instead of allocState, we use borrowerState
 
+#[derive(Debug)]
 pub enum NewPermission {
     Read,
     Write,
@@ -278,15 +279,135 @@ impl BorrowerState {
         interp_ok(())
     }
 
+    /// Apply a mutable reborrow to the exposed-stack state, respecting both `Ref` and `RawPtr`
+    /// sources.  The function encapsulates all of the "where does the new tag go in the stack?"
+    /// logic that used to live inline inside `NewPermission::Write`.
+    ///
+    /// Returns the *previous effective borrower tag* (top-of-stack `current_borrower` when a
+    /// stack exists, or `self.current_borrower` when it does not).  The caller can use this
+    /// value as the `shared_borrower` entry when creating a two-phase (Reserved) borrow.
+    ///
+    /// # Errors
+    /// Returns a string describing UB if the reborrow is not permitted.
+    pub fn apply_reborrow_to_stack(
+        &mut self,
+        parent_tag: BorTag,
+        new_tag: BorTag,
+        source: RetagReferenceSource,
+        alloc_id: AllocId,
+    ) -> Result<BorTag, String> {
+        // The "effective current borrower" is the top of the exposed stack when one exists,
+        // otherwise it is the bare current_borrower field.
+        let old_tag = self
+            .exposed_stack
+            .as_deref()
+            .and_then(<[_]>::last)
+            .map(|e| e.current_borrower)
+            .unwrap_or(self.current_borrower);
+
+        match source {
+            RetagReferenceSource::RawPtr => {
+                if old_tag == parent_tag {
+                    // Parent matches the effective current borrower: push a new stack entry that
+                    // records the old tag as the base and the new tag as the current borrower.
+                    self.exposed_stack
+                        .get_or_insert_with(Vec::new)
+                        .push(RawPointerStack { base_pointer: old_tag, current_borrower: new_tag });
+                    println!(
+                        "Updated allocation {:?} exposed_stack to {:?}",
+                        alloc_id, self.exposed_stack
+                    );
+                } else {
+                    // Parent does not match the effective current borrower — try to recover.
+                    let stack_non_empty =
+                        self.exposed_stack.as_ref().map_or(false, |s| !s.is_empty());
+                    if stack_non_empty {
+                        // Stack present: the top entry's base_pointer must equal old_tag for the
+                        // reborrow to make sense (the entry is in a "self-loop" state where
+                        // base == current).  If so, update its current_borrower in-place.
+                        let stack = self.exposed_stack.as_mut().unwrap();
+                        let base_pointer = stack.last().unwrap().base_pointer;
+                        if old_tag != base_pointer {
+                            return Err(format!(
+                                "Raw pointer reborrow with tag {:?} does not match base pointer \
+                                 {:?} for allocation {:?}",
+                                parent_tag, base_pointer, alloc_id
+                            ));
+                        }
+                        stack.last_mut().unwrap().current_borrower = new_tag;
+                    } else {
+                        // No stack: check if prev_borrower matches — if so we can start a new
+                        // stack entry rooted at prev_borrower.
+                        match self.prev_borrower {
+                            Some(prev_tag) if prev_tag == parent_tag => {
+                                self.exposed_stack
+                                    .get_or_insert_with(Vec::new)
+                                    .push(RawPointerStack {
+                                        base_pointer: prev_tag,
+                                        current_borrower: new_tag,
+                                    });
+                                println!(
+                                    "Updated allocation {:?} exposed_stack to {:?}",
+                                    alloc_id, self.exposed_stack
+                                );
+                            }
+                            _ =>
+                                return Err(format!(
+                                    "Raw pointer reborrow with tag {:?} does not match current \
+                                     borrower {:?}, prev borrower {:?} and has no exposed stack \
+                                     for allocation {:?}",
+                                    parent_tag,
+                                    self.current_borrower,
+                                    self.prev_borrower,
+                                    alloc_id
+                                )),
+                        }
+                    }
+                }
+            }
+            RetagReferenceSource::Ref => {
+                println!("exposed stack is {:?}", self.exposed_stack);
+                if let Some(stack) = self.exposed_stack.as_mut() {
+                    if let Some(top) = stack.last_mut() {
+                        top.current_borrower = new_tag;
+                        println!(
+                            "Updated allocation {:?} current_borrower to {:?} in Stack",
+                            alloc_id, new_tag
+                        );
+                    }
+                } else {
+                    self.current_borrower = new_tag;
+                    println!(
+                        "Updated allocation {:?} current_borrower to {:?}",
+                        alloc_id, new_tag
+                    );
+                }
+            }
+        }
+
+        Ok(old_tag)
+    }
+
     pub fn remove_unreachable_tags(&self, _tags: &FxHashSet<BorTag>) {}
 
     pub fn release_protector<'tcx>(
         &self,
         _machine: &MiriMachine<'tcx>,
         _global: &GlobalState,
-        _tag: BorTag,
-        _alloc_id: AllocId,
+        tag: BorTag,
+        alloc_id: AllocId,
     ) -> InterpResult<'tcx> {
+        // Called when a stack frame ends to "return" (release) any protectors that were
+        // granted at FnEntry retag time. In SB/TB this would check that the protected
+        // tag's memory is still accessible and then remove the protection entry, allowing
+        // future conflicting accesses to proceed. HybridBorrows does not yet track
+        // protectors, so this is a no-op.
+        println!(
+            "[HB] release_protector: tag={:?}, alloc_id={:?} \
+             (no-op — protectors not yet implemented in HybridBorrows; \
+             in SB/TB this fires at frame exit to end the protected lifetime of the tag)",
+            tag, alloc_id
+        );
         interp_ok(())
     }
 }
@@ -488,58 +609,21 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                             );
                         }
                         NewPermission::Write => {
-                            match source {
-                                // again, you can have already have a exposed stack, or you can start from fresh.
-                                RetagReferenceSource::RawPtr => {
-                                    let old_tag = match borrower_state.exposed_stack {
-                                        Some(ref stack) if !stack.is_empty() => {
-                                            // If we have an exposed stack, we need to check it.
-                                            //self.check_raw_pointer_stack(borrower_state.current_borrower)
-                                            stack.last().unwrap().current_borrower
-                                        }
-                                        _ => {
-                                            // If we don't have an exposed stack, we can just use the current borrower.
-                                            //self.check_raw_pointer_stack(borrower_state.current_borrower)
-                                            borrower_state.current_borrower
-                                        }
-                                    };
-
-                                    borrower_state.exposed_stack.get_or_insert_with(Vec::new).push(
-                                        RawPointerStack {
-                                            base_pointer: old_tag,
-                                            current_borrower: new_tag,
-                                        },
-                                    );
-                                    println!(
-                                        "Updated allocation {:?} exposed_stack to {:?}",
-                                        alloc_id, borrower_state.exposed_stack
-                                    );
-                                }
-                                RetagReferenceSource::Ref => {
-                                    println!("exposed stack is {:?}", borrower_state.exposed_stack);
-                                    if let Some(stack) = borrower_state.exposed_stack.as_mut() {
-                                        if let Some(top) = stack.last_mut() {
-                                            top.current_borrower = new_tag;
-                                            println!("Updated allocation {:?} current_borrower to {:?} in Stack",
-                                                alloc_id, new_tag);
-                                        }
-                                    } else {
-                                        borrower_state.current_borrower = new_tag;
-                                        println!("Updated allocation {:?} current_borrower to {:?}",
-                                            alloc_id, new_tag);                                    
-                                    }
-                                
-                                }
-                            }
+                            borrower_state
+                                .apply_reborrow_to_stack(parent_tag, new_tag, source, alloc_id)
+                                .map_err(|msg| err_ub_format!("{msg}"))?;
                         }
                         NewPermission::TwoPhase => {
-                            let old_tag = borrower_state.current_borrower;
-                            borrower_state.current_borrower = new_tag;
+                            // Same stack logic as Write, but also record the previous effective
+                            // borrower as the shared_borrower and switch to Reserved permission.
+                            let old_tag = borrower_state
+                                .apply_reborrow_to_stack(parent_tag, new_tag, source, alloc_id)
+                                .map_err(|msg| err_ub_format!("{msg}"))?;
                             borrower_state.shared_borrower = Some((old_tag, 1));
                             borrower_state.perms.permission = BorrowerPermission::Reserved;
                             println!(
-                                "Updated allocation {:?} to two-phase borrow with tag {:?}",
-                                alloc_id, new_tag
+                                "Updated allocation {:?} to two-phase borrow with tag {:?}. (The stack looks like {:?})",
+                                alloc_id, new_tag, borrower_state.exposed_stack
                             );
                         }
                     }
@@ -591,7 +675,18 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     },
                 BorrowerPermission::Reserved =>
                     match perm {
-                        NewPermission::Read => {}
+                        NewPermission::Read => {
+                            // The allocation is Reserved (two-phase): the shared_borrower tag
+                            // was set when the two-phase borrow was created and represents the
+                            // "read-only" view that concurrent shared borrows must share.
+                            // Inherit it instead of minting a new tag.
+                            let (shr_tag, _count) = borrower_state.shared_borrower.unwrap();
+                            new_prov = Provenance::Concrete { alloc_id, tag: shr_tag };
+                            println!(
+                                "Reserved allocation {:?}: Read reborrow inherits shared tag {:?}",
+                                alloc_id, shr_tag
+                            );
+                        }
                         NewPermission::Write => {
                             borrower_state.current_borrower = new_tag;
                             borrower_state.perms.permission = BorrowerPermission::Write;
@@ -734,15 +829,131 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// Retag all pointers stored in a place
     fn hb_retag_place_contents(
         &mut self,
-        _kind: RetagKind,
-        _place: &PlaceTy<'tcx>,
+        kind: RetagKind,
+        place: &PlaceTy<'tcx>,
     ) -> InterpResult<'tcx> {
-        // For hybrid borrows, we don't recursively retag place contents yet
-        // This would require a visitor pattern similar to tree_borrows
-        interp_ok(())
+        println!(
+            "[HB] retag_place_contents: kind={:?}, place_ty={:?}",
+            kind,
+            place.layout.ty
+        );
+        
+        if kind == RetagKind::FnEntry {
+            println!(
+                "[HB]   -> FnEntry retag: in SB/TB, references retagged here would receive \
+                 protectors (strong for &mut, weak for Box). Protectors are 'returned' \
+                 (released) when the function frame ends, via release_protector on each \
+                 allocation the protected tag touches."
+            );
+        }
+
+        struct RetagVisitor<'ecx, 'tcx> {
+            ecx: &'ecx mut MiriInterpCx<'tcx>,
+            kind: RetagKind,
+            in_field: bool,
+        }
+
+        impl<'ecx, 'tcx> RetagVisitor<'ecx, 'tcx> {
+            #[inline(always)]
+            fn retag_ptr_inplace(
+                &mut self,
+                place: &PlaceTy<'tcx>,
+                perm: NewPermission,
+                source: RetagReferenceSource,
+            ) -> InterpResult<'tcx> {
+                // `Retag(place)` operates on pointers already stored inside `place`.
+                // So we read the old pointer value from memory, retag that pointer,
+                // and then write the fresh pointer back into the same location.
+                println!(
+                    "[HB]   retag_ptr_inplace: ty={:?}, perm={:?}, source={:?}{}",
+                    place.layout.ty,
+                    perm,
+                    source,
+                    if self.kind == RetagKind::FnEntry { " [PROTECTED]" } else { "" }
+                );
+                let val = self.ecx.read_immediate(&self.ecx.place_to_op(place)?)?;
+                let val = self.ecx.hb_retag_reference(&val, perm, source)?;
+                self.ecx.write_immediate(*val, place)?;
+                interp_ok(())
+            }
+        }
+
+        impl<'ecx, 'tcx> ValueVisitor<'tcx, MiriMachine<'tcx>> for RetagVisitor<'ecx, 'tcx> {
+            type V = PlaceTy<'tcx>;
+
+            #[inline(always)]
+            fn ecx(&self) -> &MiriInterpCx<'tcx> {
+                self.ecx
+            }
+
+            fn visit_box(&mut self, box_ty: ty::Ty<'tcx>, place: &PlaceTy<'tcx>) -> InterpResult<'tcx> {
+                // Mirror Stacked Borrows here: only boxes using the global allocator get
+                // special treatment, and the actual retag happens on the pointer field.
+                if box_ty.is_box_global(*self.ecx.tcx) {
+                    self.retag_ptr_inplace(place, NewPermission::Write, RetagReferenceSource::Ref)?;
+                }
+                interp_ok(())
+            }
+
+            fn visit_value(&mut self, place: &PlaceTy<'tcx>) -> InterpResult<'tcx> {
+                // Values smaller than a pointer cannot contain any pointer we need to retag.
+                // This also keeps the recursive walk cheap for ZST-heavy layouts.
+                if place.layout.is_sized() && place.layout.size < self.ecx.pointer_size() {
+                    return interp_ok(());
+                }
+
+                match place.layout.ty.kind() {
+                    ty::Ref(_, _, mutability) => {
+                        let perm = match mutability {
+                            ty::Mutability::Mut => NewPermission::Write,
+                            ty::Mutability::Not => NewPermission::Read,
+                        };
+                        self.retag_ptr_inplace(place, perm, RetagReferenceSource::Ref)?;
+                    }
+                    ty::RawPtr(_, mutability) => {
+                        // Like SB, raw pointers are only retagged for `RetagKind::Raw`.
+                        if self.kind == RetagKind::Raw {
+                            let perm = match mutability {
+                                ty::Mutability::Mut => NewPermission::Write,
+                                ty::Mutability::Not => NewPermission::Read,
+                            };
+                            self.retag_ptr_inplace(place, perm, RetagReferenceSource::RawPtr)?;
+                        }
+                    }
+                    ty::Adt(adt, _) if adt.is_box() => {
+                        // Boxes need special handling via `visit_box`, so recurse into them
+                        // instead of treating them like an ordinary aggregate.
+                        self.walk_value(place)?;
+                    }
+                    _ => {
+                        // For aggregates, recursively retag any pointer-valued fields they
+                        // contain. We keep a small bit of state so debug prints can tell whether
+                        // a retag happened in a nested field.
+                        let in_field = std::mem::replace(&mut self.in_field, true);
+                        self.walk_value(place)?;
+                        self.in_field = in_field;
+                    }
+                }
+
+                interp_ok(())
+            }
+        }
+
+        let this = self.eval_context_mut();
+        let mut visitor = RetagVisitor { ecx: this, kind, in_field: false };
+        visitor.visit_value(place)
     }
 
     fn hb_protect_place(&mut self, place: &MPlaceTy<'tcx>) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
+        // Called for in-place function arguments (e.g. `fn foo(x: &mut T)`).
+        // In SB/TB a protector tag is registered here so that any access through a
+        // *different* pointer while the frame is live triggers UB.
+        // HybridBorrows does not yet implement protectors, so this is a no-op.
+        println!(
+            "[HB] protect_place: ty={:?} (no-op — protectors not yet implemented in HybridBorrows; \
+             in SB/TB this would register the tag as protected until frame exit)",
+            place.layout.ty
+        );
         interp_ok(place.clone())
     }
 
@@ -851,53 +1062,125 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     fn hb_before_terminator(&mut self) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
-        let frame = this.frame();
-        let loc = frame.current_loc();
 
-        if let Either::Left(target_loc) = loc {
-            let body = &this.body();
-            if let Some(block) = body.basic_blocks.get(target_loc.block) {
-                if let Some(terminator) = &block.terminator {
-                    //println!("Before terminator at {:?}: {:?}", target_loc, terminator);
+        // Phase 1: collect everything we need from immutable borrows.
+        // Keeping this in a scoped block ensures all borrows are dropped before
+        // phase 2, where we need to call mutable methods on `this`.
+        //
+        // If the terminator is a `Call`, we also collect the subset of arguments
+        // whose static type is `&mut T` — those are the only candidates for
+        // two-phase borrow activation.
+        let mut_ref_call_args: Option<Vec<rustc_middle::mir::Operand<'tcx>>> = {
+            let frame = this.frame();
+            let loc = frame.current_loc();
 
-                    match &terminator.kind {
-                        rustc_middle::mir::TerminatorKind::Call { func, .. } => {
-                            println!("Call terminator at {:?}: func={:?}", target_loc, func,);
-                        }
-                        rustc_middle::mir::TerminatorKind::TailCall { func, args, .. } => {
-                            println!(
-                                "TailCall terminator at {:?}: func={:?}, args={:?}",
-                                target_loc, func, args,
-                            );
-                        }
-                        rustc_middle::mir::TerminatorKind::Return => {
-                            println!(
-                                "Return terminator at {:?}: returning from {} into {:?}",
-                                target_loc,
-                                frame.instance(),
-                                frame.return_place,
-                            );
+            if let Either::Left(target_loc) = loc {
+                let body = &this.body();
+                if let Some(block) = body.basic_blocks.get(target_loc.block) {
+                    if let Some(terminator) = &block.terminator {
+                        match &terminator.kind {
+                            rustc_middle::mir::TerminatorKind::Call { func, args, .. } => {
+                                println!(
+                                    "Call terminator at {:?}: func={:?}",
+                                    target_loc, func,
+                                );
+                                // Only keep operands whose static type is `&mut _`.
+                                let mut_refs = args
+                                    .iter()
+                                    .filter_map(|s| {
+                                        let place = match &s.node {
+                                            rustc_middle::mir::Operand::Copy(p)
+                                            | rustc_middle::mir::Operand::Move(p) => p,
+                                            rustc_middle::mir::Operand::Constant(_)
+                                            | rustc_middle::mir::Operand::RuntimeChecks(_) =>
+                                                return None,
+                                        };
+                                        let ty = body.local_decls[place.local].ty;
+                                        matches!(
+                                            ty.kind(),
+                                            ty::Ref(_, _, ty::Mutability::Mut)
+                                        )
+                                        .then(|| s.node.clone())
+                                    })
+                                    .collect::<Vec<_>>();
+                                Some(mut_refs)
+                            }
+                            rustc_middle::mir::TerminatorKind::TailCall { func, args, .. } => {
+                                println!(
+                                    "TailCall terminator at {:?}: func={:?}, args={:?}",
+                                    target_loc, func, args,
+                                );
+                                None
+                            }
+                            rustc_middle::mir::TerminatorKind::Return => {
+                                println!(
+                                    "Return terminator at {:?}: returning from {} into {:?}",
+                                    target_loc,
+                                    frame.instance(),
+                                    frame.return_place,
+                                );
 
-                            // Enforcing it here is very likely wrong.
-                            if let Some(facts_map) = &this.machine.polonius_facts {
-                                if let Some(facts) = facts_map.get(&frame.instance().def_id()) {
-                                    if let Some(return_borrowers) =
-                                        facts.return_borrowers.get(&target_loc)
+                                // Enforcing it here is very likely wrong.
+                                if let Some(facts_map) = &this.machine.polonius_facts {
+                                    if let Some(facts) =
+                                        facts_map.get(&frame.instance().def_id())
                                     {
-                                        if let Some(return_ref_args) =
-                                            &return_borrowers.return_ref_args
+                                        if let Some(return_borrowers) =
+                                            facts.return_borrowers.get(&target_loc)
                                         {
-                                            let return_ref_args = return_ref_args.clone();
-                                            println!(
-                                                "Reference-typed function arguments at return {:?}: {:?}",
-                                                target_loc, return_ref_args,
-                                            );
+                                            if let Some(return_ref_args) =
+                                                &return_borrowers.return_ref_args
+                                            {
+                                                let return_ref_args = return_ref_args.clone();
+                                                println!(
+                                                    "Reference-typed function arguments at return {:?}: {:?}",
+                                                    target_loc, return_ref_args,
+                                                );
+                                            }
                                         }
                                     }
                                 }
+                                None
                             }
+                            _ => None,
                         }
-                        _ => {}
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }; // all borrows on `this` dropped here
+
+        // Phase 2: activate any Reserved two-phase borrows in the call's &mut arguments.
+        //
+        // Per the two-phase borrow scheme, a Reserved borrow must be promoted to Write
+        // at the point the function call actually happens — before the callee's frame is
+        // set up.  We scan every `&mut` argument, read the pointer it contains, and
+        // switch the underlying allocation from Reserved → Write.
+        if let Some(args) = mut_ref_call_args {
+            for arg in &args {
+                let op = this.eval_operand(arg, None)?;
+                let imm = this.read_immediate(&op)?;
+                let mplace = this.ref_to_mplace(&imm)?;
+                let Ok((alloc_id, _, prov)) = this.ptr_try_get_alloc_id(mplace.ptr(), 0)
+                else {
+                    continue;
+                };
+                let ProvenanceExtra::Concrete(tag) = prov else { continue };
+                if let AllocKind::LiveData = this.get_alloc_info(alloc_id).kind {
+                    let mut state =
+                        this.get_alloc_extra(alloc_id)?.borrow_tracker_hb().borrow_mut();
+                    if state.perms.permission == BorrowerPermission::Reserved {
+                        println!(
+                            "[HB] Activating two-phase borrow: alloc={:?}, tag={:?}: Reserved → Write",
+                            alloc_id, tag
+                        );
+                        state.perms.permission = BorrowerPermission::Write;
+                        state.shared_borrower = None;
                     }
                 }
             }

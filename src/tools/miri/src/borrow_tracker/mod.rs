@@ -4,7 +4,7 @@ use std::num::NonZero;
 
 use rustc_abi::Size;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_middle::mir::{BorrowKind, RetagKind, PoloniusAnchorData, PoloniusAnchorId, PoloniusAnchorKind};
+use rustc_middle::mir::{BorrowKind, RetagKind, PoloniusAnchorData, PoloniusAnchorId};
 use smallvec::SmallVec;
 
 use crate::*;

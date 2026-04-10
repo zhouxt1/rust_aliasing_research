@@ -202,11 +202,11 @@ fn apply_ctfe_limit<'tcx>(body: &mut Body<'tcx>) {
     }
 }
 
-pub(crate) fn prepare_polonius_mir_for_miri<'tcx>(
+pub fn prepare_polonius_mir_for_miri<'tcx>(
     tcx: TyCtxt<'tcx>,
     facts: &PoloniusFacts<'tcx>,
 ) -> Body<'tcx> {
-    let mut body = facts.body.clone();
+    let mut body = facts.body.clone().expect("prepare_polonius_mir_for_miri called without a body (stdlib facts have body=None)");
  
     // rewrite_false_edges(&mut body);
     add_return_borrower_anchors_with_patch(&mut body, facts);

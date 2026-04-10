@@ -13,6 +13,7 @@ use rand::{Rng, SeedableRng};
 use rustc_abi::{Align, ExternAbi, Size};
 use rustc_apfloat::{Float, FloatConvert};
 use rustc_ast::expand::allocator::{self, SpecialAllocatorMethod};
+use rustc_borrowck::consumers::{BorrowIndex, PoloniusRegionVid};
 use rustc_data_structures::either::Either;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 #[allow(unused)]
@@ -41,9 +42,6 @@ use crate::concurrency::sync::SyncObj;
 use crate::concurrency::{
     AllocDataRaceHandler, GenmcCtx, GenmcEvalContextExt as _, GlobalDataRaceHandler, weak_memory,
 };
-
-use rustc_borrowck::consumers::{BorrowIndex, PoloniusRegionVid};
-
 use crate::*;
 
 /// First real-time signal.
@@ -384,7 +382,8 @@ pub struct PoloniusFacts<'tcx> {
     pub predecessor_borrowers:
         FxHashMap<mir::BasicBlock, FxHashMap<mir::BasicBlock, ReturnBorrowers>>,
     pub retags: FxHashMap<Location, Vec<RecordedRetag<'tcx>>>,
-    pub body: mir::Body<'tcx>,
+    /// The already-prepared Polonius MIR body for this function, when available.
+    pub body: Option<mir::Body<'tcx>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1239,21 +1238,23 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
 
     // define our own 'load_mir' here
     fn load_mir(
-            ecx: &InterpCx<'tcx, Self>,
-            instance: ty::InstanceKind<'tcx>,
-        ) -> &'tcx mir::Body<'tcx> {
+        ecx: &InterpCx<'tcx, Self>,
+        instance: ty::InstanceKind<'tcx>,
+    ) -> &'tcx mir::Body<'tcx> {
         let func_id = instance.def_id();
 
-        println!("Loading the Polonius MIR into Miri for function {:?}", func_id); 
-        
+        println!("Loading the Polonius MIR into Miri for function {:?}", func_id);
+
         if let Some(facts_map) = &ecx.machine.polonius_facts {
             if let Some(facts) = facts_map.get(&func_id) {
-                let body = crate::polonius_pass::prepare_polonius_mir_for_miri(*ecx.tcx, facts);
-                // Allocate the body on the TyCtxt arena to get a &'tcx reference
-                return ecx.tcx.arena.alloc(body);
+                if facts.body.is_some() {
+                    return ecx.tcx.arena.alloc(facts.body.clone().unwrap());
+                }
+                // If we have facts but no body, fall through to the normal path.
             }
         }
 
+        println!("No Polonius facts for function {:?}, falling back to normal MIR", func_id);
         match instance {
             ty::InstanceKind::Item(def) => ecx.tcx.mir_for_ctfe(def),
             _ => ecx.tcx.instance_mir(instance),

@@ -16,7 +16,10 @@ pub fn miri_start(_argc: isize, _argv: *const *const u8) -> isize {
     let raw1 = ref1 as *mut i32;
 
     let ref2 = unsafe { &mut *raw1 };
+    let ref3 = unsafe { &mut *raw1 };
+
     *ref2 += 1; 
+    *ref3 += 2; 
 
     *ref1 += 1; 
     //*ref2 += 1;

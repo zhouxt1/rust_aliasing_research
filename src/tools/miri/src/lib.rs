@@ -90,7 +90,7 @@ mod intrinsics;
 mod machine;
 mod math;
 mod operator;
-mod polonius_pass;
+pub mod polonius_pass;
 mod provenance_gc;
 mod shims;
 
