@@ -66,6 +66,15 @@ fn add_return_borrower_anchors_with_patch<'tcx>(body: &mut Body<'tcx>, facts: &P
                 PoloniusAnchorKind::TwoPhaseReturnBorrower { locals: locals.clone() },
             ));
         }
+
+        if let Some(locals) = &return_borrowers.return_ref_args
+            && !locals.is_empty()
+        {
+            pending.push((
+                location,
+                PoloniusAnchorKind::ReturnRefArgs { locals: locals.clone() },
+            ));
+        }
     }
 
     pending.sort_by_key(|(location, _)| (location.block.as_usize(), location.statement_index));
@@ -213,6 +222,20 @@ pub fn prepare_polonius_mir_for_miri<'tcx>(
     rustc_mir_transform::run_analysis_to_runtime_passes(tcx, &mut body);
     body = remap_mir_for_const_eval_select(tcx, body, hir::Constness::Const);
     //apply_ctfe_limit(&mut body);
+
+    // Insert a Nop at the start of the entry block as a marker that this body
+    // was prepared by the Polonius pipeline.
+    // let start_block = &mut body.basic_blocks.as_mut()[mir::START_BLOCK];
+    // start_block.statements.insert(
+    //     0,
+    //     Statement::new(
+    //         start_block.statements.first().map_or(
+    //             mir::SourceInfo::outermost(body.span),
+    //             |s| s.source_info,
+    //         ),
+    //         StatementKind::Nop,
+    //     ),
+    // );
 
     body
 }

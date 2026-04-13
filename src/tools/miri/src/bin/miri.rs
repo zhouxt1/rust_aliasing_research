@@ -19,13 +19,11 @@ extern crate rustc_hir_analysis;
 extern crate rustc_interface;
 extern crate rustc_log;
 extern crate rustc_middle;
-extern crate rustc_serialize;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_target;
 extern crate rustc_borrowck;
 extern crate polonius_engine;
-extern crate rustc_index;
 
 /// See docs in https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc/src/main.rs
 /// and https://github.com/rust-lang/rust/pull/146627 for why we need this.
@@ -42,10 +40,8 @@ extern crate rustc_index;
 extern crate tikv_jemalloc_sys as _;
 
 mod log;
-mod stdlib_facts;
 
 use std::env;
-use std::path::PathBuf;
 use std::num::{NonZero, NonZeroI32};
 use std::cell::RefCell;
 use std::ops::Range;
@@ -74,7 +70,6 @@ use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::exported_symbols::{
     ExportedSymbol, SymbolExportInfo, SymbolExportKind, SymbolExportLevel,
 };
-use rustc_middle::mir::ClearCrossCrate;
 use rustc_middle::query::LocalCrate;
 use rustc_middle::traits::{ObligationCause, ObligationCauseCode};
 use rustc_middle::ty::{self, Ty, TyCtxt};
@@ -285,14 +280,9 @@ fn compute_retags<'tcx>(
     //let basic_blocks = body.basic_blocks.as_mut();
     let local_decls = &body.local_decls;
     let needs_retag = |place: &Place<'tcx>| {
-        let is_deref_temp = match local_decls[place.local].local_info.as_ref() {
-            ClearCrossCrate::Set(info) => matches!(**info, rustc_middle::mir::LocalInfo::DerefTemp),
-            // Cross-crate MIR clears some local info. Be conservative and keep the retag.
-            ClearCrossCrate::Clear => false,
-        };
         !place.is_indirect_first_projection()
             && may_contain_reference(place.ty(local_decls, tcx).ty, 3, tcx)
-            && !is_deref_temp
+            && !local_decls[place.local].is_deref_temp()
     };
 
     let mut retags = FxHashMap::default();
@@ -371,32 +361,6 @@ fn compute_retags<'tcx>(
     }
 
     retags
-}
-
-fn build_prepared_polonius_facts<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    body_with_facts: &BodyWithBorrowckFacts<'tcx>,
-    output: &polonius_engine::Output<RustcFacts>,
-) -> miri::PoloniusFacts<'tcx> {
-    let (return_borrowers, live_on_entry, predecessor_borrowers) =
-        compute_return_borrowers(body_with_facts, output);
-    let prepare_input = miri::PoloniusFacts {
-        live_on_entry: live_on_entry.clone(),
-        return_borrowers: return_borrowers.clone(),
-        predecessor_borrowers: predecessor_borrowers.clone(),
-        retags: FxHashMap::default(),
-        body: Some(body_with_facts.body.clone()),
-    };
-    let prepared_body = miri::polonius_pass::prepare_polonius_mir_for_miri(tcx, &prepare_input);
-    let retags = compute_retags(tcx, &prepared_body);
-
-    miri::PoloniusFacts {
-        live_on_entry,
-        return_borrowers,
-        predecessor_borrowers,
-        retags,
-        body: Some(prepared_body),
-    }
 }
 
 fn compute_return_borrowers<'tcx>(
@@ -703,7 +667,7 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
             debug!("Running Polonius analysis for Hybrid Borrows...");
             let mut facts_map = rustc_data_structures::fx::FxHashMap::default();
             MIR_BODIES.with(|state| {
-                let map = state.borrow();
+                let map: std::cell::Ref<'_, std::collections::HashMap<LocalDefId, BodyWithBorrowckFacts<'static>, rustc_data_structures::fx::FxBuildHasher>> = state.borrow();
                 for (def_id, body_with_facts) in map.iter() {      
 
                     let body_with_facts: &BodyWithBorrowckFacts<'tcx> =
@@ -712,25 +676,30 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
                     if let Some(input_facts) = &body_with_facts.input_facts {
                         let algorithm = polonius_engine::Algorithm::DatafrogOpt;
                         let output = polonius_engine::Output::compute(input_facts, algorithm, true);
-                        let facts = build_prepared_polonius_facts(tcx, body_with_facts, &output);
-                        facts_map.insert(def_id.to_def_id(), facts);
+                        let (return_borrows, live_on_entry, predecessor_borrowers) =
+                            compute_return_borrowers(body_with_facts, &output);
+                        // println!(
+                        //     "compute_return_borrowers: def_id={:?}, return_borrowers={:#?}",
+                        //     def_id.to_def_id(),
+                        //     return_borrows
+                        // );
+
+                        let retags = compute_retags(tcx, &body_with_facts.body);
+
+                        facts_map.insert(def_id.to_def_id(), miri::PoloniusFacts {
+                            live_on_entry,
+                            return_borrowers: return_borrows,
+                            predecessor_borrowers,
+                            retags,
+                            body: Some(body_with_facts.body.clone()),
+                            body_is_prepared: false,
+                        });
                     }
 
-                    // This body_with_facts.body is Important. I need to replace the body used by the interpreter with this Body.
-
-                }
+                    // This body_with_facts.body is Important. I need to replace the body used by the interpreter with this Body. 
+                    
+                }                
             });
-
-            // Load precomputed stdlib facts from the sysroot.
-            let sysroot_path = env::var_os("MIRI_SYSROOT")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    let fallback = PathBuf::from("/Users/xiaotianzhou/Documents/rust_project/rust_aliasing_research/build/aarch64-apple-darwin/miri-sysroot");
-                    if fallback.exists() { fallback } else { panic!("MIRI_SYSROOT environment variable is not set, and the fallback path {:?} does not exist. Please set MIRI_SYSROOT to the path of the sysroot containing precomputed facts for the standard library.", fallback) }
-                });
-            println!("Loading stdlib facts from sysroot: {:?}", sysroot_path);
-            stdlib_facts::load_stdlib_facts(tcx, &sysroot_path, &mut facts_map);
-
             Some(facts_map)
         } else {
             None
@@ -810,7 +779,7 @@ impl rustc_driver::Callbacks for MiriDepCompilerCalls {
                     .retain(|&c| c == CrateType::Executable || c == CrateType::Rlib);
                 if any_crate_types {
                     // Assert that we didn't remove all crate types if any crate type was passed on
-                    // the cli. Otherwise we might silently change what kind of crate we are binding.
+                    // the cli. Otherwise we might silently change what kind of crate we are building.
                     assert!(!config.opts.crate_types.is_empty());
                 }
             }
@@ -819,12 +788,52 @@ impl rustc_driver::Callbacks for MiriDepCompilerCalls {
         // Queries overridden here affect the data stored in `rmeta` files of dependencies,
         // which will be used later in non-`MIRI_BE_RUSTC` mode.
         config.override_queries = Some(|_, local_providers| {
-            // // Collect Polonius facts during sysroot compilation so we can serialize them
-            // // for later use when running user programs with Hybrid Borrows.
-            // // Only activated when MIRI_SYSROOT is set (i.e., during `cargo miri setup`).
-            // if std::env::var_os("MIRI_SYSROOT").is_some() {
-            //     local_providers.queries.mir_borrowck = mir_borrowck;
-            // }
+            // Collect Polonius facts during sysroot compilation so we can serialize
+            // MIR bodies for later use when running user programs with Hybrid Borrows.
+            local_providers.queries.mir_borrowck = mir_borrowck;
+
+            // Provide the borrowck MIR body for encoding into rmeta.
+            // When encode_mir calls tcx.polonius_mir(def_id), this provider
+            // returns the body from MIR_BODIES (populated by mir_borrowck above).
+            local_providers.queries.polonius_mir = |tcx, local_def_id| {
+                MIR_BODIES.with(|state| {
+                    let map = state.borrow();
+                    map.get(&local_def_id).and_then(|bwf| {
+                        let bwf: &BodyWithBorrowckFacts<'_> =
+                            unsafe { std::mem::transmute(bwf) };
+                        let input_facts = bwf.input_facts.as_ref()?;
+
+                        // Run Polonius engine.
+                        let algorithm = polonius_engine::Algorithm::DatafrogOpt;
+                        let output = polonius_engine::Output::compute(input_facts, algorithm, true);
+
+                        // Derive facts needed for anchor insertion.
+                        // Skip compute_retags — the raw borrowck body has unnormalized
+                        // place projections that trip assertions. Retags aren't stored in
+                        // the body anyway; they're only used at runtime via PoloniusFacts.
+                        let (return_borrowers, live_on_entry, predecessor_borrowers) =
+                            compute_return_borrowers(bwf, &output);
+
+                        // Erase region inference variables BEFORE running MIR transforms.
+                        // The borrowck body has stale ReVar indices that would crash
+                        // trait resolution in run_analysis_to_runtime_passes.
+                        let erased_body = tcx.erase_and_anonymize_regions(bwf.body.clone());
+
+                        // Build PoloniusFacts and run the full preparation pipeline
+                        // (anchor insertion + MIR transforms + const_eval_select remap).
+                        let facts = miri::PoloniusFacts {
+                            live_on_entry,
+                            return_borrowers,
+                            predecessor_borrowers,
+                            retags: FxHashMap::default(),
+                            body: Some(erased_body),
+                            body_is_prepared: false,
+                        };
+                        let prepared = miri::polonius_pass::prepare_polonius_mir_for_miri(tcx, &facts);
+                        Some(&*tcx.arena.alloc(prepared))
+                    })
+                })
+            };
 
             // We need to add #[used] symbols to exported_symbols for `lookup_link_section`.
             // FIXME handle this somehow in rustc itself to avoid this hack.
@@ -890,90 +899,6 @@ impl rustc_driver::Callbacks for MiriDepCompilerCalls {
         // So let's also do that here. In particular this is needed to make `compile_fail`
         // doc tests trigger post-mono errors.
         let _ = tcx.collect_and_partition_mono_items(());
-        
-        // let's wait on this
-        // // Serialize Polonius facts to the sysroot so user programs can load them.
-        // if let Some(sysroot_os) = std::env::var_os("MIRI_SYSROOT") {
-        //     let sysroot = std::path::PathBuf::from(sysroot_os);
-
-        //     // // Skip Polonius fact collection for crates we don't need.
-        //     // const SKIP_CRATES: &[&str] = &["compiler_builtins"];
-        //     // let crate_name = tcx.crate_name(LOCAL_CRATE);
-        //     // if SKIP_CRATES.iter().any(|&s| crate_name.as_str() == s) {
-        //     //     eprintln!("[miri] skipping Polonius fact collection for crate `{crate_name}`");
-        //     //     return Compilation::Continue;
-        //     // }
-
-        //     // During sysroot precompilation, eagerly force borrowck/fact collection for every
-        //     // local item that has MIR. Otherwise `MIR_BODIES` only contains whichever bodies the
-        //     // normal compilation happened to query, and stdlib functions can miss the
-        //     // `polonius_facts` map entirely at runtime.
-        //     let crate_items = tcx.hir_crate_items(());
-        //     for local_def_id in crate_items.definitions() {
-        //         if tcx.is_mir_available(local_def_id.to_def_id())
-        //             && !tcx.is_trivial_const(local_def_id)
-        //         {
-        //             let _ = tcx.mir_borrowck(local_def_id);
-        //         }
-        //     }
-
-        //     MIR_BODIES.with(|state| {
-        //         let map = state.borrow();
-        //         if map.is_empty() {
-        //             return;
-        //         }
-
-        //         // Compute facts for every function collected during this compilation.
-        //         let mut functions = Vec::new();
-        //         for (def_id, body_with_facts) in map.iter() {
-        //             let body_with_facts: &BodyWithBorrowckFacts<'tcx> =
-        //                 unsafe { std::mem::transmute(body_with_facts) };
-
-        //             if let Some(input_facts) = &body_with_facts.input_facts {
-        //                 let algorithm = polonius_engine::Algorithm::DatafrogOpt;
-        //                 let output = polonius_engine::Output::compute(input_facts, algorithm, true);
-        //                 let facts = build_prepared_polonius_facts(tcx, body_with_facts, &output);
-
-        //                 let def_path_hash = tcx.def_path_hash(def_id.to_def_id());
-        //                 functions.push(stdlib_facts::SerializedFunctionFacts {
-        //                     def_path_hash,
-        //                     live_on_entry: facts.live_on_entry,
-        //                     return_borrowers: facts.return_borrowers,
-        //                     predecessor_borrowers: facts.predecessor_borrowers,
-        //                     prepared_mir: stdlib_facts::encode_prepared_mir(
-        //                         tcx,
-        //                         facts.body.as_ref().expect("prepared facts missing body"),
-        //                     ),
-        //                     serialized_retags: stdlib_facts::encode_retags(tcx, &facts.retags),
-        //                 });
-        //             }
-        //         }
-
-        //         if functions.is_empty() {
-        //             return;
-        //         }
-
-        //         // One file per crate, named by crate name + stable crate id.
-        //         let crate_name = tcx.crate_name(LOCAL_CRATE);
-        //         let stable_crate_hash = tcx.stable_crate_id(LOCAL_CRATE).as_u64();
-        //         let facts_path = stdlib_facts::facts_file_for_crate(
-        //             &sysroot,
-        //             crate_name.as_str(),
-        //             stable_crate_hash,
-        //         );
-
-        //         match stdlib_facts::write_facts_file(&facts_path, &functions) {
-        //             Ok(()) => eprintln!(
-        //                 "[miri] serialized {} Polonius facts for crate `{crate_name}` to {}",
-        //                 functions.len(),
-        //                 facts_path.display()
-        //             ),
-        //             Err(e) => eprintln!(
-        //                 "[miri] warning: failed to write Polonius facts for `{crate_name}`: {e}"
-        //             ),
-        //         }
-        //     });
-        // }
 
         Compilation::Continue
     }

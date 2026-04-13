@@ -74,6 +74,7 @@ pub enum PoloniusAnchorKind {
     MutReturnBorrower { locals: Vec<Local> },
     SharedReturnVar { locals: Vec<Local> },
     TwoPhaseReturnBorrower { locals: Vec<Local> },
+    ReturnRefArgs { locals: Vec<Local> },
 }
 
 #[derive(Clone, TyEncodable, TyDecodable, Debug, PartialEq, Eq, Hash, HashStable)]

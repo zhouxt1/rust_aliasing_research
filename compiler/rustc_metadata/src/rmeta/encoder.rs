@@ -1826,6 +1826,10 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             debug!("EntryBuilder::encode_mir({:?})", def_id);
             if encode_opt {
                 record!(self.tables.optimized_mir[def_id.to_def_id()] <- tcx.optimized_mir(def_id));
+                // Also encode Polonius MIR if available (populated during Miri sysroot build).
+                if let Some(body) = tcx.polonius_mir(def_id.to_def_id()) {
+                    record!(self.tables.polonius_mir[def_id.to_def_id()] <- body);
+                }
                 self.tables
                     .cross_crate_inlinable
                     .set(def_id.to_def_id().index, self.tcx.cross_crate_inlinable(def_id));

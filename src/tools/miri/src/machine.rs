@@ -42,6 +42,7 @@ use crate::concurrency::sync::SyncObj;
 use crate::concurrency::{
     AllocDataRaceHandler, GenmcCtx, GenmcEvalContextExt as _, GlobalDataRaceHandler, weak_memory,
 };
+use crate::shims::panic;
 use crate::*;
 
 /// First real-time signal.
@@ -382,8 +383,12 @@ pub struct PoloniusFacts<'tcx> {
     pub predecessor_borrowers:
         FxHashMap<mir::BasicBlock, FxHashMap<mir::BasicBlock, ReturnBorrowers>>,
     pub retags: FxHashMap<Location, Vec<RecordedRetag<'tcx>>>,
-    /// The already-prepared Polonius MIR body for this function, when available.
+    /// The MIR body for this function, when available.
     pub body: Option<mir::Body<'tcx>>,
+    /// If `true`, the body is already fully prepared (e.g. loaded from sysroot)
+    /// and can be used directly by `load_mir`. If `false`, it still needs to go
+    /// through `prepare_polonius_mir_for_miri`.
+    pub body_is_prepared: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1243,18 +1248,39 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
     ) -> &'tcx mir::Body<'tcx> {
         let func_id = instance.def_id();
 
-        println!("Loading the Polonius MIR into Miri for function {:?}", func_id);
-
+        // 1. Check user-code Polonius facts (computed at compile time).
         if let Some(facts_map) = &ecx.machine.polonius_facts {
             if let Some(facts) = facts_map.get(&func_id) {
-                if facts.body.is_some() {
-                    return ecx.tcx.arena.alloc(facts.body.clone().unwrap());
+                if let Some(ref body) = facts.body {
+                    if facts.body_is_prepared {
+                        return ecx.tcx.arena.alloc(body.clone());
+                    } else {
+                        let prepared = crate::polonius_pass::prepare_polonius_mir_for_miri(*ecx.tcx, facts);
+                        return ecx.tcx.arena.alloc(prepared);
+                    }
                 }
-                // If we have facts but no body, fall through to the normal path.
             }
+
+
         }
 
-        println!("No Polonius facts for function {:?}, falling back to normal MIR", func_id);
+        // 2. Try loading Polonius MIR from rmeta (stdlib bodies from sysroot rlibs).
+        if let Some(body) = ecx.tcx.polonius_mir(func_id) {
+            // let has_nop_marker = body.basic_blocks[mir::START_BLOCK]
+            //     .statements
+            //     .first()
+            //     .is_some_and(|stmt| matches!(stmt.kind, mir::StatementKind::Nop));
+            // println!(
+            //     "Loading Polonius MIR for {:?} (prepared={})",
+            //     func_id, has_nop_marker,
+            // );
+            println!("loading Polonius MIR");
+            return body;
+        }
+
+        // 3. Fallback: normal MIR loading.
+
+        println!("Loading Normal MIR for");
         match instance {
             ty::InstanceKind::Item(def) => ecx.tcx.mir_for_ctfe(def),
             _ => ecx.tcx.instance_mir(instance),

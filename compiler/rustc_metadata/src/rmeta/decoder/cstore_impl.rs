@@ -240,6 +240,14 @@ provide! { tcx, def_id, other, cdata,
     object_lifetime_default => { table }
     thir_abstract_const => { table }
     optimized_mir => { table }
+    polonius_mir => {
+        cdata
+            .root
+            .tables
+            .polonius_mir
+            .get((cdata, tcx), def_id.index)
+            .map(|lazy| &*tcx.arena.alloc(lazy.decode((cdata, tcx))))
+    }
     mir_for_ctfe => { table }
     trivial_const => { table }
     closure_saved_names_of_captured_variables => { table }

@@ -1055,6 +1055,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     println!("Polonius anchor for two-phase return borrower local {:?}", local);
                     this.hb_restore_return_borrower_from_local(local)?;
                 },
+            PoloniusAnchorKind::ReturnRefArgs { locals } =>
+                for &local in locals {
+                    println!("Polonius anchor for return ref arg local {:?}", local);
+                    this.hb_restore_return_borrower_from_local(local)?;
+                },
         }
 
         interp_ok(())

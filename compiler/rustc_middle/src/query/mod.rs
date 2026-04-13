@@ -749,6 +749,14 @@ rustc_queries! {
         separate_provide_extern
     }
 
+    /// The borrowck MIR body, stored during Miri sysroot build for Hybrid Borrows.
+    /// Returns `None` for functions that were not compiled with Polonius fact collection.
+    query polonius_mir(key: DefId) -> Option<&'tcx mir::Body<'tcx>> {
+        desc { |tcx| "retrieving Polonius MIR for `{}`", tcx.def_path_str(key) }
+        cache_on_disk_if { key.is_local() }
+        separate_provide_extern
+    }
+
     /// Checks for the nearest `#[coverage(off)]` or `#[coverage(on)]` on
     /// this def and any enclosing defs, up to the crate root.
     ///
