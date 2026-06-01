@@ -12,9 +12,9 @@ fn panic(_info: &PanicInfo) -> ! {
 
 fn optimize_me(safe_ref: &mut i32, raw_ptr: *mut i32) -> i32 {
     let val1 = *safe_ref;      // Load 1
-    unsafe { *raw_ptr = 42; }  // Potential invalidation?
-    let val2 = *safe_ref;      // Load 2
-    val1 + val2
+    unsafe { *raw_ptr = 42; }  
+    // This invalidates the program. However, our system cannot catch it for now. 
+    val1
 }
 
 /// Now we want to test something else. We want to know

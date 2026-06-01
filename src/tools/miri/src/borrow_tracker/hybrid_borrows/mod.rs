@@ -6,15 +6,42 @@ use rustc_middle::mir::{
 };
 use rustc_middle::ty;
 
-use crate::borrow_tracker::{AccessKind, BorTag, GlobalState, GlobalStateInner};
+use rustc_data_structures::fx::FxHashMap;
+
+use crate::borrow_tracker::{AccessKind, BorTag, GlobalState, GlobalStateInner, ProtectorKind};
 use crate::*;
+
+/// Determine what kind of protector (if any) to install for a FnEntry retag of the given type.
+///
+/// Mirrors SB's `NewPermission::from_ref_ty` protector logic:
+/// - `&mut T` and `&T` → `StrongProtector` (noalias + dereferenceable, dealloc is UB)
+/// - `Box<T>`          → `WeakProtector`   (noalias only, dealloc is allowed)
+/// - everything else   → `None`
+fn hb_protector_for(ty: ty::Ty<'_>) -> Option<ProtectorKind> {
+    match ty.kind() {
+        ty::Ref(_, _, ty::Mutability::Mut) => Some(ProtectorKind::StrongProtector),
+        ty::Ref(_, _, ty::Mutability::Not) => Some(ProtectorKind::StrongProtector),
+        ty::Adt(..) if ty.is_box() => Some(ProtectorKind::WeakProtector),
+        _ => None,
+    }
+}
 
 mod borrower;
 
 pub use self::borrower::{BorrowerPermission, BorrowerState, RawPointerStack};
 
-// instead of allocState, we use borrowerState
+// The Hybrid Borrows alloc-extra is the per-allocation `BorrowerState` directly. SB and TB use
+// dedicated wrapper types (`Stacks`, `Tree`); HB stores `BorrowerState` itself, which is why
+// `AllocState = BorrowerState` below.
 
+/// Permission requested at a reborrow site.
+///
+/// Maps to the runtime `BorrowerPermission` transitions inside `hb_reborrow`:
+/// - `Read` — building a shared `&T` reborrow.
+/// - `Write` — building a mutable `&mut T` reborrow.
+/// - `TwoPhase` — building a two-phase mutable borrow; the resulting allocation enters
+///   `BorrowerPermission::Reserved` and is later promoted to `Write` by
+///   `hb_before_terminator` at the activating call site.
 #[derive(Debug)]
 pub enum NewPermission {
     Read,
@@ -22,6 +49,12 @@ pub enum NewPermission {
     TwoPhase,
 }
 
+/// Whether a reborrow's source pointer is a normal reference or a raw pointer.
+///
+/// Threaded through `hb_retag_ptr_value` → `hb_retag_reference` → `hb_retag_place` →
+/// `hb_reborrow` → `apply_reborrow_to_stack`. The `RawPtr` case is what enables the
+/// `RawPointerStack` chain to grow; the `Ref` case overwrites the existing top of stack
+/// (or `current_borrower` if no stack) without pushing a new entry.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RetagReferenceSource {
     Ref,
@@ -31,23 +64,54 @@ pub enum RetagReferenceSource {
 pub type AllocState = BorrowerState;
 type BorrowCheckResult = Result<(), String>;
 
-/// Core per-location operations: access, dealloc, reborrow.
+/// Core per-location access logic: validate a tag against `BorrowerState` for a given access kind.
+///
+/// All four methods in this impl are pure logic over the per-allocation state — they don't touch
+/// the Miri context. The two checkers (`check_unique_borrower_tag` and `check_raw_pointer_stack`)
+/// implement the two halves of the dispatch, and `check_borrower_tag` chooses between them based
+/// on `perms.permission` plus the access kind. `access` is the entry called from
+/// `before_memory_access` and converts a `BorrowCheckResult` into `InterpResult`.
 impl<'tcx> BorrowerState {
-    /// Check if the tag matches current or previous borrower
-    fn check_unique_borrower_tag(&mut self, bor_tag: BorTag) -> BorrowCheckResult {
+    /// Validate `bor_tag` against `current_borrower` / `prev_borrower` for an access that does
+    /// **not** involve the raw-pointer exposed stack.
+    ///
+    /// Side effect: on a successful match against `current_borrower`, `prev_borrower` is cleared.
+    /// (The slot only exists to bridge the brief window after a reborrow when both the parent
+    /// and the new tag may legitimately appear at access sites.)
+    ///
+    /// Status: working. Returns `Ok(())` when `bor_tag` matches `current_borrower` (clearing
+    /// any held `prev_borrower`), or matches `prev_borrower`. Otherwise returns a message
+    /// describing the mismatch.
+    ///
+    /// Interacts with: `check_borrower_tag`, `check_raw_pointer_stack` (the alternative path),
+    /// `hb_return_mut_borrower` (which writes to `prev_borrower`).
+    fn check_unique_borrower_tag(
+        &mut self,
+        bor_tag: BorTag,
+        protected: &FxHashMap<BorTag, ProtectorKind>,
+    ) -> BorrowCheckResult {
         if self.current_borrower == bor_tag {
             println!(
                 "   Access granted: current borrower {:?} matches access tag {:?}",
                 self.current_borrower, bor_tag
             );
 
-            if let Some(_prev) = self.prev_borrower {
-                self.prev_borrower = None; // Clear previous borrower after successful access
+            if let Some(prev) = self.prev_borrower {
+                // Before clearing prev_borrower, check whether it is protected.
+                // Clearing a protected tag means it can never be accessed again through
+                // its original handle — that is a protector violation.
+                if let Some(kind) = protected.get(&prev) {
+                    return Err(format!(
+                        "protector violation: prev_borrower {:?} is {:?}-protected \
+                         but displaced by access through {:?}",
+                        prev, kind, bor_tag
+                    ));
+                }
+                self.prev_borrower = None;
             }
             Ok(())
         } else {
             if let Some(prev_tag) = self.prev_borrower {
-                // Handle case where previous borrower exists
                 if prev_tag == bor_tag {
                     println!(
                         "   Access granted: previous borrower {:?} matches access tag {:?}",
@@ -69,7 +133,27 @@ impl<'tcx> BorrowerState {
         }
     }
 
-    fn check_raw_pointer_stack(&mut self, bor_tag: BorTag) -> BorrowCheckResult {
+    /// Validate `bor_tag` against the raw-pointer exposed stack and `current_borrower`.
+    ///
+    /// Walks `exposed_stack` from the top down. Two ways to accept:
+    /// 1. `bor_tag` matches an entry's `current_borrower` — entries above are popped (siblings
+    ///    derived later are invalidated by the access through this older one).
+    /// 2. `bor_tag` matches an entry's `base_pointer` — accepts an access through the original
+    ///    parent of a raw chain; if the `base_pointer` differs from the lower-level current
+    ///    borrower, it's stashed into `prev_borrower` for a possible follow-up access through
+    ///    the parent.
+    /// Falls back to a direct `current_borrower == bor_tag` check at the bottom of the stack.
+    ///
+    /// Status: working for the patterns covered by `pass/test1.rs` and `pass/test6.rs`. The
+    /// stack truncation logic is the load-bearing piece of raw-pointer aliasing in HB.
+    ///
+    /// Interacts with: `check_borrower_tag` (the dispatcher), `apply_reborrow_to_stack` (which
+    /// pushes entries this method later consumes).
+    fn check_raw_pointer_stack(
+        &mut self,
+        bor_tag: BorTag,
+        protected: &FxHashMap<BorTag, ProtectorKind>,
+    ) -> BorrowCheckResult {
         println!("Checking raw pointer stack for access tag {:?}", bor_tag);
         if let Some(exposed_stack) = self.exposed_stack.as_mut() {
             for idx in (0..exposed_stack.len()).rev() {
@@ -81,6 +165,17 @@ impl<'tcx> BorrowerState {
                 };
 
                 if entry.current_borrower == bor_tag {
+                    // Before truncating entries above idx, check whether any of them are
+                    // protected. Popping a protected raw-stack entry is a protector violation.
+                    for displaced in exposed_stack[idx + 1..].iter() {
+                        if let Some(kind) = protected.get(&displaced.current_borrower) {
+                            return Err(format!(
+                                "protector violation: raw pointer access through {:?} displaced \
+                                 protected tag {:?} ({:?})",
+                                bor_tag, displaced.current_borrower, kind
+                            ));
+                        }
+                    }
                     exposed_stack.truncate(idx + 1);
 
                     if exposed_stack.is_empty() {
@@ -95,6 +190,27 @@ impl<'tcx> BorrowerState {
                 }
 
                 if entry.base_pointer == bor_tag {
+                    // Check entries that will be popped (above idx, and idx itself if we pop it).
+                    for displaced in exposed_stack[idx + 1..].iter() {
+                        if let Some(kind) = protected.get(&displaced.current_borrower) {
+                            return Err(format!(
+                                "protector violation: raw pointer access through {:?} displaced \
+                                 protected tag {:?} ({:?})",
+                                bor_tag, displaced.current_borrower, kind
+                            ));
+                        }
+                    }
+                    // Also check the entry at idx itself if it will be popped.
+                    if entry.base_pointer != lower_current_borrower {
+                        if let Some(kind) = protected.get(&entry.current_borrower) {
+                            return Err(format!(
+                                "protector violation: raw pointer base access through {:?} displaced \
+                                 protected tag {:?} ({:?})",
+                                bor_tag, entry.current_borrower, kind
+                            ));
+                        }
+                    }
+
                     exposed_stack.truncate(idx + 1);
 
                     if entry.base_pointer != lower_current_borrower {
@@ -129,77 +245,81 @@ impl<'tcx> BorrowerState {
         ))
     }
 
-    fn check_borrower_tag(&mut self, bor_tag: BorTag, kind: AccessKind) -> BorrowCheckResult {
+    /// Top-level access check: validate `bor_tag` against the current `BorrowerState` for an
+    /// access of `kind`. The dispatcher of the access path.
+    ///
+    /// `protected` is the global protected-tags map, threaded in from `access()` so the inner
+    /// checkers can verify that no protected tag is displaced as a side-effect of this access.
+    ///
+    /// Behavior depends on `perms.permission`:
+    /// - `Read` — read accepted via `shared_borrower` tag, otherwise via the unique-borrower /
+    ///   raw-stack path. Writes are denied.
+    /// - `Write` — uses raw stack if present, otherwise unique borrower.
+    /// - `Frozen` — read accepted via `shared_borrower` or unique borrower; a write upgrades
+    ///   the location to `Write` permission and clears `shared_borrower`.
+    /// - `Reserved` (two-phase) — read accepted via either the reserving tag or the
+    ///   `shared_borrower`; a write activates: permission becomes `Write` and `shared_borrower`
+    ///   is cleared. (The activation that fires at the call site is in `hb_before_terminator`;
+    ///   this is the access-time activation.)
+    ///
+    /// Interacts with: `check_unique_borrower_tag`, `check_raw_pointer_stack`, `access` (caller).
+    fn check_borrower_tag(
+        &mut self,
+        bor_tag: BorTag,
+        kind: AccessKind,
+        protected: &FxHashMap<BorTag, ProtectorKind>,
+    ) -> BorrowCheckResult {
         match self.perms.permission {
             BorrowerPermission::Read => {
                 match kind {
                     AccessKind::Read => {
-                        // Allow read access
-                        // this is through shared tag or borrower tag.
                         let (shr_tag, _count) = self.shared_borrower.unwrap();
                         if shr_tag == bor_tag {
                             Ok(())
                         } else {
-                            // I could also access through the current borrower
                             if self.exposed_stack.is_some() {
-                                self.check_raw_pointer_stack(bor_tag)
+                                self.check_raw_pointer_stack(bor_tag, protected)
                             } else {
-                                self.check_unique_borrower_tag(bor_tag)
+                                self.check_unique_borrower_tag(bor_tag, protected)
                             }
                         }
                     }
-                    AccessKind::Write => {
-                        // Deny write access on a shared borrow
+                    AccessKind::Write =>
                         Err(format!(
                             "Access denied: write access on a shared borrow with tag {:?}",
                             bor_tag
-                        ))
-                    }
+                        )),
                 }
             }
             BorrowerPermission::Write =>
                 if self.exposed_stack.is_some() {
-                    self.check_raw_pointer_stack(bor_tag)
+                    self.check_raw_pointer_stack(bor_tag, protected)
                 } else {
-                    self.check_unique_borrower_tag(bor_tag)
+                    self.check_unique_borrower_tag(bor_tag, protected)
                 },
-            BorrowerPermission::Frozen => {
-                // Handle frozen permission
+            BorrowerPermission::Frozen =>
                 match kind {
                     AccessKind::Read => {
-                        // Allow read access on a frozen borrow, similar to the access
-                        // but we need to check the tags as well.
                         let (shr_tag, _count) = self.shared_borrower.unwrap();
                         if shr_tag == bor_tag {
                             Ok(())
                         } else {
-                            // I could also access through the current borrower
-                            self.check_unique_borrower_tag(bor_tag)
+                            self.check_unique_borrower_tag(bor_tag, protected)
                         }
                     }
                     AccessKind::Write => {
-                        // Deny write access on a frozen borrow
-
-                        // we update the permission to Write.
-
-                        self.check_unique_borrower_tag(bor_tag)?;
+                        self.check_unique_borrower_tag(bor_tag, protected)?;
                         self.perms.permission = BorrowerPermission::Write;
-                        // reset the shared_tag
                         self.shared_borrower = None;
-
                         Ok(())
                     }
-                }
-            }
-            BorrowerPermission::Reserved => {
-                // Handle reserved permission (e.g., for two-phase borrows)
+                },
+            BorrowerPermission::Reserved =>
                 match kind {
                     AccessKind::Read => {
-                        // We first check if it matches the unique borrower tag.
-                        if self.check_unique_borrower_tag(bor_tag).is_ok() {
+                        if self.check_unique_borrower_tag(bor_tag, protected).is_ok() {
                             Ok(())
                         } else {
-                            // if not, check the shared borrower tag
                             let (shr_tag, _count) = self.shared_borrower.unwrap();
                             if shr_tag == bor_tag {
                                 println!("Access Allowed: {:?}", shr_tag);
@@ -213,27 +333,42 @@ impl<'tcx> BorrowerState {
                         }
                     }
                     AccessKind::Write => {
-                        self.check_unique_borrower_tag(bor_tag)?;
-                        // This probably also needs some rewrite, since we don't need to check prev_borrower. Since it is an active Reserved State.
-
-                        // now we need to make it Unique.
+                        self.check_unique_borrower_tag(bor_tag, protected)?;
                         self.perms.permission = BorrowerPermission::Write;
                         self.shared_borrower = None;
-
                         Ok(())
                     }
-                }
-            }
+                },
         }
     }
 
-    fn access(&mut self, tag: ProvenanceExtra, kind: AccessKind) -> InterpResult<'tcx> {
+    /// Entry point invoked from `before_memory_access` for each memory read or write.
+    ///
+    /// Extracts `protected_tags` from the machine's global borrow-tracker state and threads it
+    /// through `check_borrower_tag` so displacement checks can consult it.
+    ///
+    /// Status: partial. The non-concrete branch is an explicit TODO — without it, accesses
+    /// through wildcard provenance silently bypass aliasing checks.
+    ///
+    /// Interacts with: `before_memory_access` (caller), `check_borrower_tag` (delegate).
+    fn access(
+        &mut self,
+        tag: ProvenanceExtra,
+        kind: AccessKind,
+        machine: &MiriMachine<'_>,
+    ) -> InterpResult<'tcx> {
         if let ProvenanceExtra::Concrete(bor_tag) = tag {
             println!(
                 "Access with concrete tag {:?}, kind {:?}, and current permission {:?}",
                 bor_tag, kind, self.perms.permission
             );
-            self.check_borrower_tag(bor_tag, kind).map_err(|msg| err_ub_format!("{msg}"))?;
+            let protected = machine
+                .borrow_tracker
+                .as_ref()
+                .map(|bt| bt.borrow())
+                .expect("borrow tracker must be active");
+            self.check_borrower_tag(bor_tag, kind, &protected.protected_tags)
+                .map_err(|msg| err_ub_format!("{msg}"))?;
         } else {
             // TODO: will handle case where tag is not concrete
             println!("   Access with non-concrete access tag {:?}", tag);
@@ -242,7 +377,22 @@ impl<'tcx> BorrowerState {
     }
 }
 
+/// Allocation-lifecycle hooks invoked by Miri's alloc-extra system.
+///
+/// These are the callbacks that route Miri events — allocation creation, memory access,
+/// deallocation, GC sweeps, frame-exit protector release — into per-allocation
+/// `BorrowerState` updates. Dispatch from outside arrives via
+/// `borrow_tracker::AllocState::HybridBorrows`.
 impl BorrowerState {
+    /// Build a fresh `BorrowerState` for a newly-created allocation.
+    ///
+    /// Acquires the allocation's root pointer tag from the global state and seeds the
+    /// `BorrowerState` with it as `current_borrower` (in `Write` permission, no prev/shared,
+    /// no exposed stack — see `BorrowerState::new` in `borrower.rs`).
+    ///
+    /// Status: working.
+    ///
+    /// Interacts with: `GlobalStateInner::root_ptr_tag` (in `borrow_tracker/mod.rs`).
     pub fn new_allocation(
         id: AllocId,
         _alloc_size: Size,
@@ -254,6 +404,15 @@ impl BorrowerState {
         BorrowerState::new(tag)
     }
 
+    /// Hook invoked on every memory read or write touching this allocation.
+    ///
+    /// Delegates to the `access` access-path entry. The `_alloc_id`, `_range`, and `_machine`
+    /// parameters are presently unused; they're kept in the signature to match the dispatch
+    /// interface and to leave room for protector-aware diagnostics.
+    ///
+    /// Status: working for the corpus.
+    ///
+    /// Interacts with: `BorrowerState::access`.
     pub fn before_memory_access<'tcx>(
         &mut self,
         kind: AccessKind,
@@ -264,31 +423,72 @@ impl BorrowerState {
     ) -> InterpResult<'tcx> {
         //let location = machine.threads.active_thread_stack().last().map(|frame| frame.current_loc());
 
-        self.access(tag, kind)?;
+        self.access(tag, kind, _machine)?;
 
         interp_ok(())
     }
 
+    /// Hook invoked just before this allocation is deallocated.
+    ///
+    /// Status: **not implemented** — empty body. SB and TB use this hook to enforce the
+    /// "no deallocation while a `StrongProtector` exists on the allocation" rule. HB has no
+    /// protectors yet, so this is currently a no-op. Implementing protectors will require
+    /// scanning `GlobalStateInner.protected_tags` here for any `StrongProtector` whose tag
+    /// belongs to this allocation, and erroring if so. See [docs/open-work.md § Protectors].
+    ///
+    /// Interacts with: future protector enforcement in Phase 2 of the protector plan.
     pub fn before_memory_deallocation<'tcx>(
         &mut self,
-        _alloc_id: AllocId,
+        alloc_id: AllocId,
         _prov_extra: ProvenanceExtra,
         _size: Size,
-        _machine: &MiriMachine<'tcx>,
+        machine: &MiriMachine<'tcx>,
     ) -> InterpResult<'tcx> {
+        // StrongProtectors forbid deallocation; WeakProtectors (Box) allow it.
+        // Check whether current_borrower is strongly protected.
+        let protected_tags = machine
+            .borrow_tracker
+            .as_ref()
+            .map(|bt| bt.borrow())
+            .expect("borrow tracker must be active");
+        if let Some(ProtectorKind::StrongProtector) =
+            protected_tags.protected_tags.get(&self.current_borrower)
+        {
+            throw_ub_format!(
+                "deallocating alloc {:?} while tag {:?} is strongly protected",
+                alloc_id,
+                self.current_borrower
+            );
+        }
         interp_ok(())
     }
 
-    /// Apply a mutable reborrow to the exposed-stack state, respecting both `Ref` and `RawPtr`
-    /// sources.  The function encapsulates all of the "where does the new tag go in the stack?"
-    /// logic that used to live inline inside `NewPermission::Write`.
+    /// Apply a mutable reborrow to the exposed-stack state, handling both `Ref` and `RawPtr`
+    /// sources. Encapsulates the "where does the new tag go in the stack?" logic that drives
+    /// `Write → Write` and `Write → TwoPhase` reborrows in `hb_reborrow`.
     ///
-    /// Returns the *previous effective borrower tag* (top-of-stack `current_borrower` when a
-    /// stack exists, or `self.current_borrower` when it does not).  The caller can use this
-    /// value as the `shared_borrower` entry when creating a two-phase (Reserved) borrow.
+    /// Returns the *previous effective borrower tag* — top-of-stack `current_borrower` when a
+    /// stack exists, otherwise `self.current_borrower`. Callers use this for the
+    /// `shared_borrower` entry when creating a two-phase (Reserved) borrow.
+    ///
+    /// `RawPtr` source: pushes a new `RawPointerStack` entry rooted at the old top, recovers
+    /// via `prev_borrower` when no stack is present, or updates the stack top in place when
+    /// the existing top's `base_pointer` matches.
+    ///
+    /// `Ref` source: overwrites the stack top's `current_borrower` (if a stack exists) or
+    /// `self.current_borrower` directly. No new stack entry is created.
     ///
     /// # Errors
-    /// Returns a string describing UB if the reborrow is not permitted.
+    /// Returns a string describing UB if the reborrow is not permitted (e.g. the parent tag
+    /// does not match the effective current borrower and recovery via `prev_borrower` /
+    /// stack `base_pointer` fails).
+    ///
+    /// Status: working — this is the load-bearing piece of HB's raw-pointer-derived borrow
+    /// support and is exercised by `pass/test1.rs`, `pass/test6.rs`, and the matching `fail/`
+    /// cases.
+    ///
+    /// Interacts with: `hb_reborrow` (caller), `check_raw_pointer_stack` (consumer of pushed
+    /// entries).
     pub fn apply_reborrow_to_stack(
         &mut self,
         parent_tag: BorTag,
@@ -376,10 +576,13 @@ impl BorrowerState {
                         );
                     }
                 } else {
+                    // Record the displaced tag so `release_protector` can verify that the
+                    // new effective borrower is a legitimate child, not an alias.
+                    self.reborrow_chain.push(self.current_borrower);
                     self.current_borrower = new_tag;
                     println!(
-                        "Updated allocation {:?} current_borrower to {:?}",
-                        alloc_id, new_tag
+                        "Updated allocation {:?} current_borrower to {:?} (reborrow_chain: {:?})",
+                        alloc_id, new_tag, self.reborrow_chain
                     );
                 }
             }
@@ -388,38 +591,136 @@ impl BorrowerState {
         Ok(old_tag)
     }
 
+    /// GC hook: called with the set of tags currently judged unreachable by Miri's provenance GC.
+    ///
+    /// SB and TB use this to drop now-dead tags from their internal stacks/trees so the
+    /// per-allocation state doesn't accumulate forever. HB's `BorrowerState` only stores a
+    /// fixed-size slice of tags (current/prev/shared plus exposed_stack entries), so there's
+    /// less to clean up — but `prev_borrower`, `shared_borrower`, and stack tags can in
+    /// principle be cleared here.
+    ///
+    /// Status: not implemented — empty body. Combined with `visit_provenance` only walking
+    /// `current_borrower`, this means GC behavior on HB allocations is approximate. See
+    /// [status.md] entries on GC and `remove_unreachable_tags`.
     pub fn remove_unreachable_tags(&self, _tags: &FxHashSet<BorTag>) {}
 
+    /// Frame-exit hook: called by the generic `on_stack_pop` in `borrow_tracker/mod.rs` once per
+    /// `(AllocId, BorTag)` pair recorded in the popped frame's `protected_tags` list.
+    ///
+    /// SB and TB use this to (a) optionally fire an implicit read through the protected tag
+    /// (for `StrongProtector`, to detect stale memory), and (b) remove the tag from the
+    /// per-allocation protection set. The generic `end_call` then removes it from the global
+    /// `protected_tags` map.
+    ///
+    /// Status: **not implemented** — logging-only no-op. Phase 3 of the protector plan
+    /// ([docs/open-work.md § Protectors]) replaces this body with the real implementation.
+    /// Until then, no `(alloc_id, tag)` pairs are ever pushed into HB's frames, so this is
+    /// effectively dead code.
+    ///
+    /// Interacts with: future Phase-1 work that will push to `frame.extra.protected_tags`.
     pub fn release_protector<'tcx>(
         &self,
         _machine: &MiriMachine<'tcx>,
-        _global: &GlobalState,
+        global: &GlobalState,
         tag: BorTag,
         alloc_id: AllocId,
     ) -> InterpResult<'tcx> {
-        // Called when a stack frame ends to "return" (release) any protectors that were
-        // granted at FnEntry retag time. In SB/TB this would check that the protected
-        // tag's memory is still accessible and then remove the protection entry, allowing
-        // future conflicting accesses to proceed. HybridBorrows does not yet track
-        // protectors, so this is a no-op.
-        println!(
-            "[HB] release_protector: tag={:?}, alloc_id={:?} \
-             (no-op — protectors not yet implemented in HybridBorrows; \
-             in SB/TB this fires at frame exit to end the protected lifetime of the tag)",
-            tag, alloc_id
-        );
+        let kind = global.borrow().protected_tags.get(&tag).copied();
+        match kind {
+            Some(ProtectorKind::StrongProtector) => {
+                // Implicit read: the protected tag must still be the *effective* current
+                // borrower, OR the effective borrower must be a descendant of the protected
+                // tag via a Ref-source reborrow chain (`reborrow_chain`).
+                //
+                // The second condition handles the common pattern where the function body
+                // creates a child reborrow of its own argument (e.g. `Option::as_mut` does
+                // `Some(ref mut x)` which produces a `&mut T` child of `self`). In Stacked
+                // Borrows the parent tag stays in the borrow stack below the child; in HB
+                // we record it in `reborrow_chain` instead.
+                //
+                // When the function argument was raw-pointer-derived, the tag lives in
+                // `exposed_stack.last().current_borrower` rather than `current_borrower`. If
+                // something corrupted the allocation (e.g. a write through the raw base
+                // pointer), the stack entry gets popped and the effective borrower will differ
+                // from `tag` — and `reborrow_chain` will not contain `tag` either, so the
+                // violation is still caught.
+                let effective = self
+                    .exposed_stack
+                    .as_deref()
+                    .and_then(<[_]>::last)
+                    .map(|e| e.current_borrower)
+                    .unwrap_or(self.current_borrower);
+                if effective != tag && !self.reborrow_chain.contains(&tag) {
+                    throw_ub_format!(
+                        "protector violation at frame exit: \
+                         tag {:?} in alloc {:?} is no longer the effective current borrower \
+                         (effective is {:?}, base current_borrower is {:?}) — \
+                         memory was likely invalidated via an aliasing raw pointer during the call",
+                        tag,
+                        alloc_id,
+                        effective,
+                        self.current_borrower
+                    );
+                }
+                println!(
+                    "[HB] release_protector: implicit read OK for tag {:?} in alloc {:?} \
+                     (effective={:?}, in_chain={})",
+                    tag, alloc_id, effective, self.reborrow_chain.contains(&tag)
+                );
+            }
+            Some(ProtectorKind::WeakProtector) => {
+                // WeakProtector (Box): deallocation is permitted, so no implicit read.
+                // Just let end_call remove the tag from the global map.
+                println!(
+                    "[HB] release_protector: weak protector released for tag {:?} in alloc {:?}",
+                    tag, alloc_id
+                );
+            }
+            None => {
+                // Tag was already released early (e.g. Polonius early release). Nothing to do.
+            }
+        }
         interp_ok(())
     }
 }
 
+/// GC support: tells Miri's provenance GC which tags this `BorrowerState` keeps alive.
+///
+/// Status: partial. Only visits `current_borrower`. Misses `prev_borrower`, the
+/// `shared_borrower` tag, and every tag in `exposed_stack`. In practice this is mostly safe
+/// because those tags also survive elsewhere (e.g. on locals, in `FrameState.protected_tags`),
+/// but it's a known soundness wart for the GC. See [status.md] "Provenance GC visit".
 impl VisitProvenance for BorrowerState {
+    /// Visit the `current_borrower` tag only. See the `impl` doc comment above for the gap.
     fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
         visit(None, Some(self.current_borrower));
     }
 }
 
 impl<'tcx> EvalContextPrivExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+/// Private helpers used by the public `hb_*` surface in `EvalContextExt`.
+///
+/// Everything in this trait runs against a `MiriInterpCx` (so it has access to allocations,
+/// frames, MIR bodies, Polonius facts) but is not directly dispatched from the generic
+/// `borrow_tracker/mod.rs` interface.
 trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
+    /// Reinstall a previously-recorded mutable borrow's tag as the `current_borrower` of its
+    /// allocation, when Polonius signals that an outstanding loan has expired and the parent
+    /// reference should "take back" access.
+    ///
+    /// Given a `Local` that holds (or holds a reference to) the borrowed allocation, looks up
+    /// the underlying `(alloc_id, tag)` and feeds the tag into `hb_return_mut_borrower`.
+    ///
+    /// Status: **partial / known-buggy**. The inline doc comment in the body documents the
+    /// issue: `compute_return_borrowers` currently passes the *base* local (e.g. `_1` in
+    /// `_8 = &mut _1`) rather than the reference local (`_8`). Because creating `_8` already
+    /// updated the allocation's `current_borrower` to `_8`'s tag, this lookup recovers the
+    /// *newest* tag rather than the borrower we wanted to restore. Several "loan returned"
+    /// cases therefore become silent no-ops. Tracked in [docs/open-work.md § ReturnBorrowers
+    /// correctness].
+    ///
+    /// Interacts with: `hb_return_mut_borrower` (delegate), `hb_apply_return_borrowers`
+    /// (caller via Polonius anchors), `ReturnBorrowers` in `machine.rs`.
     fn hb_restore_return_borrower_from_local(&mut self, local: Local) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let src = this.local_to_place(local)?;
@@ -448,6 +749,17 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 
+    /// Handle a Polonius signal that a shared-reference variable has gone out of scope.
+    ///
+    /// Decrements the `shared_borrower` refcount on the underlying allocation. When the count
+    /// reaches zero and the location is still in `Read` permission, transitions to `Frozen`
+    /// (which means the location remembers the most-recent shared tag and a subsequent write
+    /// can upgrade back to `Write`).
+    ///
+    /// Status: working for the corpus.
+    ///
+    /// Interacts with: `hb_apply_return_borrowers` (caller), `hb_handle_polonius_anchor`'s
+    /// `SharedReturnVar` branch, `BorrowerPermission::{Read, Frozen}`.
     fn hb_handle_dropped_shared_return_var_from_local(
         &mut self,
         local: Local,
@@ -484,6 +796,25 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 
+    /// At a control-flow location with associated `ReturnBorrowers` facts, apply each kind of
+    /// loan-return to the runtime state.
+    ///
+    /// Three groups are processed (in this order):
+    /// 1. `return_shared_var` — shared loans whose owning variable has died; routed to
+    ///    `hb_handle_dropped_shared_return_var_from_local`.
+    /// 2. `mut_borrows` — mutable loans being returned; routed to
+    ///    `hb_restore_return_borrower_from_local` to reinstall the parent's tag.
+    /// 3. `two_phase` — same shape as `mut_borrows` for two-phase loans.
+    ///
+    /// `return_ref_args` and the legacy `shared` field on `ReturnBorrowers` are not consumed
+    /// here; the former is logged at `Return` terminators in `hb_before_terminator` only.
+    ///
+    /// Status: works for the patterns it covers, but inherits the
+    /// `hb_restore_return_borrower_from_local` correctness issue — see [docs/open-work.md
+    /// § ReturnBorrowers correctness].
+    ///
+    /// Interacts with: `hb_before_statement` (caller via `predecessor_borrowers`),
+    /// `hb_handle_polonius_anchor`, `ReturnBorrowers` (input data shape).
     fn hb_apply_return_borrowers(
         &mut self,
         target_loc: rustc_middle::mir::Location,
@@ -527,8 +858,21 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 
-    /// Update the borrower state for an allocation with a new tag.
-    /// Also tracks the previous borrower for potential conflict detection.
+    /// Set `new_tag` as `current_borrower` of `alloc_id` and stash the old tag into
+    /// `prev_borrower`, modeling the "parent reference takes back its loan" transition.
+    ///
+    /// Special case: if the location is currently in `Read` permission, the location is
+    /// transitioned to `Frozen` (since reinstalling a mutable parent over a shared loan
+    /// effectively closes the shared phase but doesn't yet upgrade to exclusive write).
+    ///
+    /// Only operates on `LiveData` allocations.
+    ///
+    /// Status: working as an isolated update primitive — but its caller
+    /// `hb_restore_return_borrower_from_local` may be feeding it the wrong tag (see that
+    /// function's status note and [docs/open-work.md § ReturnBorrowers correctness]).
+    ///
+    /// Interacts with: `hb_restore_return_borrower_from_local` (caller),
+    /// `BorrowerPermission::{Read, Frozen, Write}`.
     fn hb_return_mut_borrower(&mut self, alloc_id: AllocId, new_tag: BorTag) -> InterpResult<'tcx> {
         // this return borrower should be called only when it is returning a mut borrow. Therefore, we do need to update state directly
         let this = self.eval_context_mut();
@@ -539,6 +883,9 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             let old_tag = borrower_state.current_borrower;
             borrower_state.current_borrower = new_tag;
             borrower_state.prev_borrower = Some(old_tag);
+            // Loan returned via Polonius: the reborrow chain is no longer meaningful since
+            // current_borrower is now the restored parent, not a child reborrow.
+            borrower_state.reborrow_chain.clear();
 
             // if it is in 'read state', we move it to frozen directly.
             if borrower_state.perms.permission == BorrowerPermission::Read {
@@ -550,8 +897,27 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 
-    /// Perform the core reborrowing logic.
-    /// This creates a new tag and updates the borrower state.
+    /// Core reborrow logic: validate the parent tag and update `BorrowerState` for the new tag.
+    ///
+    /// The transition table is keyed by the pair `(current BorrowerPermission, requested
+    /// NewPermission)`:
+    ///
+    /// | from / to    | Read                          | Write                                                        | TwoPhase                                                            |
+    /// |--------------|-------------------------------|--------------------------------------------------------------|---------------------------------------------------------------------|
+    /// | `Write`      | enter `Read`, set shared tag  | `apply_reborrow_to_stack` (push raw entry or overwrite top)  | `apply_reborrow_to_stack` + Reserved permission, shared = old tag    |
+    /// | `Read`       | refcount bump, inherit tag    | UB                                                           | UB                                                                  |
+    /// | `Frozen`     | inherit shared tag            | upgrade to `Write`, set new tag as borrower                  | (handled by direct field update + Reserved + shared = old)          |
+    /// | `Reserved`   | inherit shared tag            | promote to `Write`                                           | start a fresh two-phase, shared = old tag                           |
+    ///
+    /// Returns the new `Provenance` to write back into the place. Errors are reported as
+    /// `err_ub_format!` strings.
+    ///
+    /// Status: working for the corpus. The protector side-effect that should fire on
+    /// `RetagKind::FnEntry` is **not** present here; see [docs/open-work.md § Protectors,
+    /// Phase 1].
+    ///
+    /// Interacts with: `apply_reborrow_to_stack` (Write/TwoPhase from Write), `check_borrower_tag`
+    /// (parent-tag validation), `hb_retag_place` (caller).
     fn hb_reborrow(
         &mut self,
         place: &MPlaceTy<'tcx>,
@@ -581,9 +947,13 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             let mut borrower_state =
                 this.get_alloc_extra(alloc_id)?.borrow_tracker_hb().borrow_mut();
 
-            // we need to check the borrower state by accessing it. It might or might not change the current memory state.
+            // Validate the parent tag before creating the child reborrow.
+            // We pass an empty protected map here because this check is purely validating
+            // that the parent tag is currently valid — it is not an access that displaces
+            // any other tag, so no protector check is needed at this call site.
+            let empty_protected = FxHashMap::default();
             borrower_state
-                .check_borrower_tag(parent_tag, AccessKind::Read)
+                .check_borrower_tag(parent_tag, AccessKind::Read, &empty_protected)
                 .map_err(|msg| {
                     err_ub_format!(
                         "invalid parent tag {:?} for reborrow at allocation {:?} with permission {:?}: {}",
@@ -655,11 +1025,16 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                             println!("Keep frozen allocation {:?}", alloc_id);
                         }
                         NewPermission::Write => {
+                            // Frozen→Write: the new exclusive write is still derived (transitively)
+                            // from the same ancestry as the previous current_borrower. Push the old
+                            // tag into reborrow_chain so `release_protector` can verify ancestry.
+                            let old_cb = borrower_state.current_borrower;
+                            borrower_state.reborrow_chain.push(old_cb);
                             borrower_state.current_borrower = new_tag;
                             borrower_state.perms.permission = BorrowerPermission::Write;
                             println!(
-                                "Updated allocation {:?} current_borrower to {:?}",
-                                alloc_id, new_tag
+                                "Updated allocation {:?} current_borrower to {:?} (reborrow_chain: {:?})",
+                                alloc_id, new_tag, borrower_state.reborrow_chain
                             );
                         }
                         NewPermission::TwoPhase => {
@@ -688,11 +1063,16 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                             );
                         }
                         NewPermission::Write => {
+                            // Reserved→Write: the Write reborrow still descends from the same
+                            // ancestry as the Reserved tag. Push the old current_borrower so
+                            // `release_protector` can verify that protected ancestors are intact.
+                            let old_cb = borrower_state.current_borrower;
+                            borrower_state.reborrow_chain.push(old_cb);
                             borrower_state.current_borrower = new_tag;
                             borrower_state.perms.permission = BorrowerPermission::Write;
                             println!(
-                                "Updated allocation {:?} current_borrower to {:?}",
-                                alloc_id, new_tag
+                                "Updated allocation {:?} current_borrower to {:?} (reborrow_chain: {:?})",
+                                alloc_id, new_tag, borrower_state.reborrow_chain
                             );
                         }
                         NewPermission::TwoPhase => {
@@ -711,7 +1091,12 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(Some(new_prov))
     }
 
-    /// Retag a place (e.g., when assigning a reference to a location)
+    /// Mint a fresh tag for `place`, run the reborrow, and return a new `MPlaceTy` with
+    /// updated provenance.
+    ///
+    /// Status: working.
+    ///
+    /// Interacts with: `hb_reborrow` (delegate), `hb_retag_reference` (caller).
     fn hb_retag_place(
         &mut self,
         place: &MPlaceTy<'tcx>,
@@ -719,18 +1104,23 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         source: RetagReferenceSource,
     ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
         let this = self.eval_context_mut();
-
-        // Create a fresh tag for this reborrow
         let new_tag = this.machine.borrow_tracker.as_mut().unwrap().get_mut().new_ptr();
-
-        // Perform the reborrow logic
         let new_prov = this.hb_reborrow(place, perm, new_tag, source)?;
-
-        // Return the place with updated provenance
         interp_ok(place.clone().map_provenance(|_| new_prov.unwrap()))
     }
 
-    /// Retag an individual reference
+    /// Retag a reference value: convert it to a place, retag in place, and rewrap as `ImmTy`.
+    ///
+    /// When `protector` is `Some`, also registers the freshly-minted tag as protected in both
+    /// the global map and the current frame's list. Registration happens here (not inside
+    /// `hb_retag_place`) to avoid provenance type-inference issues: `alloc_id` is captured
+    /// from `place.ptr()` before retagging (alloc_id is stable), and the new tag is read back
+    /// from `BorrowerState::current_borrower` after retagging.
+    ///
+    /// Status: working.
+    ///
+    /// Interacts with: `hb_retag_place` (delegate), `hb_retag_ptr_value`,
+    /// `hb_retag_place_contents`.
     fn hb_retag_reference(
         &mut self,
         val: &ImmTy<'tcx>,
@@ -738,16 +1128,107 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         source: RetagReferenceSource,
     ) -> InterpResult<'tcx, ImmTy<'tcx>> {
         let this = self.eval_context_mut();
-        // println!("Retagging reference {:?} with source {:?}", val.layout.ty, source);
         let place = this.ref_to_mplace(val)?;
         let new_place = this.hb_retag_place(&place, perm, source)?;
         interp_ok(ImmTy::from_immediate(new_place.to_ref(this), val.layout))
     }
+
+    /// Extract the `(AllocId, BorTag)` for the allocation currently pointed to by a reference
+    /// `ImmTy`. The tag returned is `current_borrower` — i.e. the freshly-minted tag after
+    /// `hb_retag_reference` has run.
+    ///
+    /// Note: `ProtectorKind` is intentionally absent from this signature. Adding it would
+    /// trigger a Rust type-inference issue in the local `RetagVisitor` struct context that
+    /// resolves `ImmTy<'tcx>` as `CtfeProvenance` instead of `Provenance`.
+    fn hb_get_ref_alloc_and_tag(
+        &mut self,
+        val: &ImmTy<'tcx>,
+    ) -> InterpResult<'tcx, Option<(AllocId, BorTag)>> {
+        let this = self.eval_context_mut();
+        let mplace = this.ref_to_mplace(val)?;
+        if let Ok((alloc_id, _, _)) = this.ptr_try_get_alloc_id(mplace.ptr(), 0) {
+            if let AllocKind::LiveData = this.get_alloc_info(alloc_id).kind {
+                let bs = this.get_alloc_extra(alloc_id)?.borrow_tracker_hb().borrow();
+                // Use the *effective* current borrower: when a raw-pointer stack is present
+                // (e.g. the arg was derived via `&mut *raw_ptr`), the freshly-minted tag
+                // lives in `exposed_stack.last().current_borrower`, not in `current_borrower`.
+                let tag = bs
+                    .exposed_stack
+                    .as_deref()
+                    .and_then(<[_]>::last)
+                    .map(|e| e.current_borrower)
+                    .unwrap_or(bs.current_borrower);
+                return interp_ok(Some((alloc_id, tag)));
+            }
+        }
+        interp_ok(None)
+    }
+
+    /// Record `(alloc_id, tag)` as a protected tag in both the global map and the current
+    /// frame's list. `is_strong` selects `StrongProtector` vs `WeakProtector`.
+    ///
+    /// `ProtectorKind` is intentionally absent from this signature for the same reason as
+    /// `hb_get_ref_alloc_and_tag` — to avoid the CtfeProvenance type-inference issue when
+    /// this is called from the local `RetagVisitor` struct.
+    fn hb_register_protector(
+        &mut self,
+        alloc_id: AllocId,
+        tag: BorTag,
+        is_strong: bool,
+    ) -> InterpResult<'tcx> {
+        let kind =
+            if is_strong { ProtectorKind::StrongProtector } else { ProtectorKind::WeakProtector };
+        println!("[HB]   registering protector {:?} for tag {:?} in alloc {:?}", kind, tag, alloc_id);
+        let this = self.eval_context_mut();
+        this.machine
+            .borrow_tracker
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .protected_tags
+            .insert(tag, kind);
+        this.frame_mut()
+            .extra
+            .borrow_tracker
+            .as_mut()
+            .unwrap()
+            .protected_tags
+            .push((alloc_id, tag));
+        interp_ok(())
+    }
 }
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+/// Public Hybrid Borrows surface dispatched from `borrow_tracker/mod.rs`.
+///
+/// Each method here is the HB-side of a generic borrow-tracker hook. The mapping is:
+/// - `retag_ptr_value` → `hb_retag_ptr_value`
+/// - `retag_place_contents` → `hb_retag_place_contents`
+/// - `protect_place` → `hb_protect_place`
+/// - `expose_tag` → `hb_expose_tag`
+/// - `give_pointer_debug_name` → `hb_give_pointer_debug_name`
+/// - `print_borrow_state` → `hb_print_borrow_state`
+/// - `before_statement` → `hb_before_statement`
+/// - `handle_polonius_anchor` → `hb_handle_polonius_anchor`
+/// - `before_terminator` → `hb_before_terminator`
+/// - `after_statement` → `hb_after_statement`
 pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
-    /// Retag a pointer value (called when creating references)
+    /// Retag a pointer value materialized by an `Rvalue::Ref` (creating a new reference).
+    ///
+    /// Inspects the current MIR statement to detect when the source of the reborrow is a raw
+    /// pointer (so `RetagReferenceSource::RawPtr` can be threaded through). Picks
+    /// `NewPermission` from the reference type plus `BorrowKind::Mut { kind: TwoPhaseBorrow }`
+    /// to recognize two-phase borrows. Delegates to `hb_retag_reference`.
+    ///
+    /// Status: working for normal reference reborrows and two-phase recognition. Note: the
+    /// `kind: RetagKind` argument is **ignored** (`let _ = kind;`) — `RetagKind::FnEntry` and
+    /// `RetagKind::Default` produce identical behavior here. The protector side-effect that
+    /// should differ between FnEntry and Default lives in `hb_retag_place_contents`, not
+    /// here, but neither path actually installs protectors today. See [docs/open-work.md
+    /// § Protectors].
+    ///
+    /// Interacts with: `hb_retag_reference` (delegate), `hb_retag_place_contents` (sibling
+    /// dispatch path).
     fn hb_retag_ptr_value(
         &mut self,
         kind: RetagKind,
@@ -826,7 +1307,24 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
     }
 
-    /// Retag all pointers stored in a place
+    /// Retag every pointer field reachable inside `place`. The dispatched entry for the
+    /// `Retag(place)` MIR statement (and for FnEntry argument retags).
+    ///
+    /// A `ValueVisitor` walks aggregates and recurses into fields, retagging each pointer
+    /// in place via `retag_ptr_inplace` → `hb_retag_reference`. `RetagKind::Raw` gates whether
+    /// raw-pointer fields are retagged at all; `&mut`/`&` fields are always retagged when
+    /// reached.
+    ///
+    /// Status: **partial — FnEntry is not really honored.** The visitor branches on the
+    /// `kind` only to gate raw-pointer retagging and to print a `[PROTECTED]` debug suffix
+    /// for `RetagKind::FnEntry`; no protector is installed and no per-frame bookkeeping is
+    /// recorded. Functionally `RetagKind::FnEntry` and `RetagKind::Default` are identical
+    /// here. Phase 1 of the protector plan ([docs/open-work.md § Protectors]) replaces the
+    /// `[PROTECTED]` suffix with the actual side-effect.
+    ///
+    /// Interacts with: `hb_retag_reference` (per-pointer delegate), `protect_place` (the
+    /// `protect_in_place_function_argument` machinery in `machine.rs:1789` that runs *before*
+    /// this for in-place arguments).
     fn hb_retag_place_contents(
         &mut self,
         kind: RetagKind,
@@ -864,16 +1362,32 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // `Retag(place)` operates on pointers already stored inside `place`.
                 // So we read the old pointer value from memory, retag that pointer,
                 // and then write the fresh pointer back into the same location.
+                let is_fn_entry = self.kind == RetagKind::FnEntry;
                 println!(
                     "[HB]   retag_ptr_inplace: ty={:?}, perm={:?}, source={:?}{}",
                     place.layout.ty,
                     perm,
                     source,
-                    if self.kind == RetagKind::FnEntry { " [PROTECTED]" } else { "" }
+                    if is_fn_entry { " [PROTECTED]" } else { "" }
                 );
                 let val = self.ecx.read_immediate(&self.ecx.place_to_op(place)?)?;
                 let val = self.ecx.hb_retag_reference(&val, perm, source)?;
                 self.ecx.write_immediate(*val, place)?;
+
+                // Protector registration is split into two helper methods that have no
+                // ProtectorKind in their signatures — adding ProtectorKind to any method
+                // called from this local struct triggers a Rust type-inference issue that
+                // resolves ImmTy<'tcx> as CtfeProvenance instead of Provenance.
+                if is_fn_entry {
+                    if let Some(kind) = hb_protector_for(place.layout.ty) {
+                        if let Some((alloc_id, new_tag)) =
+                            self.ecx.hb_get_ref_alloc_and_tag(&val)?
+                        {
+                            let is_strong = matches!(kind, ProtectorKind::StrongProtector);
+                            self.ecx.hb_register_protector(alloc_id, new_tag, is_strong)?;
+                        }
+                    }
+                }
                 interp_ok(())
             }
         }
@@ -944,6 +1458,20 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         visitor.visit_value(place)
     }
 
+    /// Hook called by `protect_in_place_function_argument` for each in-place function argument
+    /// (`&mut`, `&` non-`UnsafeCell`, `Box`).
+    ///
+    /// In SB/TB this returns a freshly-protected place: the place's tag is recorded in both
+    /// `FrameState.protected_tags` and `GlobalStateInner.protected_tags`, so any subsequent
+    /// access through a different (or invalidated) tag while the frame is live triggers UB.
+    ///
+    /// Status: **not implemented** — currently clones the input place unchanged and logs.
+    /// Without this, `fail/test4.rs` and `fail/test5.rs` (the protector tests) silently
+    /// succeed under HB. Phase 1 of [docs/open-work.md § Protectors] is "make this function
+    /// actually do something".
+    ///
+    /// Interacts with: `release_protector` (paired frame-exit hook), `hb_retag_place_contents`
+    /// (the FnEntry retag site that should also register protectors).
     fn hb_protect_place(&mut self, place: &MPlaceTy<'tcx>) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
         // Called for in-place function arguments (e.g. `fn foo(x: &mut T)`).
         // In SB/TB a protector tag is registered here so that any access through a
@@ -957,10 +1485,22 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(place.clone())
     }
 
+    /// Hook called when a tag is "exposed" (e.g. cast to an integer and back, or otherwise
+    /// laundered into a wildcard provenance).
+    ///
+    /// Status: **not implemented** — empty body. SB and TB use this to mark the tag as
+    /// available to wildcard-provenance accesses; HB ignores it. Combined with the
+    /// non-concrete branch of `access` being a TODO, this means HB currently has no model of
+    /// exposed pointers at all.
     fn hb_expose_tag(&self, _alloc_id: AllocId, _tag: BorTag) -> InterpResult<'tcx> {
         interp_ok(())
     }
 
+    /// Hook for the `miri_pointer_name` intrinsic — attaches a debug name to a tag for
+    /// diagnostic purposes.
+    ///
+    /// Status: **not implemented** — empty body. TB uses the name in tree diagnostics; HB
+    /// has no equivalent surface yet, so the intrinsic is silently a no-op.
     fn hb_give_pointer_debug_name(
         &mut self,
         _ptr: Pointer,
@@ -970,6 +1510,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 
+    /// Hook for the `miri_print_borrow_state` intrinsic — prints the borrow tracker's view of
+    /// an allocation.
+    ///
+    /// Status: **not implemented** — empty body. SB prints its stack; TB prints its tree;
+    /// HB prints nothing. Useful to implement for debugging the access path against the
+    /// `BorrowerState` field-by-field.
     fn hb_print_borrow_state(
         &mut self,
         _alloc_id: AllocId,
@@ -978,6 +1524,22 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 
+    /// Hook called before every statement Miri executes. The Polonius-driven side of the
+    /// runtime.
+    ///
+    /// Two responsibilities:
+    /// 1. **Block-entry edge handling** — when the current location is `(block, statement_index = 0)`
+    ///    and a previous block is known, look up `PoloniusFacts.predecessor_borrowers[block][pred_block]`
+    ///    and apply it via `hb_apply_return_borrowers`. This implements "loans returning across
+    ///    a CFG edge".
+    /// 2. **Logging** — report any retags scheduled `BeforeInstruction` at the current location.
+    ///
+    /// Status: working for predecessor-borrower handling; the retag-logging branch is purely
+    /// informational. The correctness ceiling is set by the upstream `ReturnBorrowers` shape
+    /// (see `hb_restore_return_borrower_from_local`).
+    ///
+    /// Interacts with: `hb_apply_return_borrowers` (delegate), `PoloniusFacts.predecessor_borrowers`
+    /// and `PoloniusFacts.retags` (data sources).
     fn hb_before_statement(&mut self) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
@@ -1032,6 +1594,26 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 
+    /// Hook called when Miri encounters a `PoloniusAnchor` MIR statement (inserted by
+    /// `polonius_pass.rs`).
+    ///
+    /// Dispatches by `PoloniusAnchorKind`:
+    /// - `MutReturnBorrower { locals }` → restore the parent's mutable borrower for each local.
+    /// - `SharedReturnVar { locals }` → decrement shared refcounts for each local.
+    /// - `TwoPhaseReturnBorrower { locals }` → restore the parent's borrower (same path as
+    ///   `MutReturnBorrower`).
+    /// - `ReturnRefArgs { locals }` → restore the parent's borrower (same path as
+    ///   `MutReturnBorrower`).
+    ///
+    /// Status: dispatch is in place but three of the four variants share a single helper.
+    /// Combined with the upstream `hb_restore_return_borrower_from_local` correctness issue,
+    /// some of these calls become silent no-ops in practice. Phase 4 of the protector plan
+    /// would extend this enum with `ProtectorEnd` for early protector release; see
+    /// [docs/open-work.md § Protectors, Phase 4].
+    ///
+    /// Interacts with: `hb_restore_return_borrower_from_local`,
+    /// `hb_handle_dropped_shared_return_var_from_local` (delegates), `polonius_pass.rs`
+    /// (anchor inserter).
     fn hb_handle_polonius_anchor(
         &mut self,
         _id: PoloniusAnchorId,
@@ -1065,6 +1647,25 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 
+    /// Hook called before every terminator. Has two responsibilities, both call-site-related.
+    ///
+    /// 1. **Two-phase activation at `Call`** — for each `&mut` operand of the call, read its
+    ///    pointer, look up the underlying allocation, and if it's in
+    ///    `BorrowerPermission::Reserved` promote it to `Write` (clearing `shared_borrower`).
+    ///    This is the activation point of two-phase borrows; the retag visitor only marks
+    ///    them Reserved, the activation must happen *here*, before the callee's frame is
+    ///    pushed.
+    /// 2. **Return-time logging** — at `Return` terminators, look up
+    ///    `PoloniusFacts.return_borrowers[loc].return_ref_args` and log it. The inline
+    ///    comment ("Enforcing it here is very likely wrong") flags that this is currently
+    ///    informational only; the actual restoration happens via `PoloniusAnchor` statements,
+    ///    not at the terminator.
+    ///
+    /// Status: two-phase activation is working and exercised by `pass/test5.rs`. The
+    /// `Return`-terminator branch is logging-only.
+    ///
+    /// Interacts with: `BorrowerPermission::{Reserved, Write}`, `hb_handle_polonius_anchor`
+    /// (the actually-enforcing partner for return-time loan handling).
     fn hb_before_terminator(&mut self) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
@@ -1194,7 +1795,15 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 
-    // now we don't really need hb_after_statement
+    /// Hook called after every statement Miri executes.
+    ///
+    /// Status: **decorative only.** Currently prints the just-executed statement (or
+    /// terminator) and a blank line. The original Polonius logic that would consume
+    /// `return_borrowers` here is left in the file as commented-out code. Could be removed
+    /// or repurposed; the inline `// now we don't really need hb_after_statement` comment
+    /// reflects this.
+    ///
+    /// Interacts with: nothing semantically — purely tracing.
     fn hb_after_statement(&mut self) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 

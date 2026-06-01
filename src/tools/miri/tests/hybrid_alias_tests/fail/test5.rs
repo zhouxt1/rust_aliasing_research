@@ -29,7 +29,6 @@ pub fn miri_start(_argc: isize, _argv: *const *const u8) -> isize {
     //let z = unsafe { &mut *raw1 }; // ok i see the problem, since y is gone after last use in the previous line, it fails to use the 'prev borrower
 
     unsafe { 
-
         let z = &mut *raw1; 
         optimize_me(z, raw1); 
     }

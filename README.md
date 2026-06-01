@@ -23,6 +23,7 @@ standard library, and documentation.
 
 This is a repo for developing the Miri implementation of the Hybrid Borrow, an alternative aliasing rule (see Stacked Borrow and Tree Borrow). This rule is the base for an aliasing sanitizer. And it uses the information from the Polonius borrow checker while aiming to find aliasing bugs. 
 
+The detailed summary is in [Research.md](Research.src/tools/miri/src/borrow_tracker/hybrid_borrows/borrower.rsmd).
 
 ## Why Rust?
 
