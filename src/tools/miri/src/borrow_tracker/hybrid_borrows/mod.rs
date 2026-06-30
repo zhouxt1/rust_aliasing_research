@@ -5,6 +5,7 @@ use rustc_middle::mir::{
     Local, PoloniusAnchorData, PoloniusAnchorId, PoloniusAnchorKind, RetagKind,
 };
 use rustc_middle::ty;
+use rustc_middle::ty::layout::HasTypingEnv;
 
 use rustc_data_structures::fx::FxHashMap;
 
@@ -88,6 +89,7 @@ impl<'tcx> BorrowerState {
     fn check_unique_borrower_tag(
         &mut self,
         bor_tag: BorTag,
+        kind: AccessKind,
         protected: &FxHashMap<BorTag, ProtectorKind>,
     ) -> BorrowCheckResult {
         if self.current_borrower == bor_tag {
@@ -96,26 +98,51 @@ impl<'tcx> BorrowerState {
                 self.current_borrower, bor_tag
             );
 
-            if let Some(prev) = self.prev_borrower {
-                // Before clearing prev_borrower, check whether it is protected.
-                // Clearing a protected tag means it can never be accessed again through
-                // its original handle — that is a protector violation.
-                if let Some(kind) = protected.get(&prev) {
-                    return Err(format!(
-                        "protector violation: prev_borrower {:?} is {:?}-protected \
-                         but displaced by access through {:?}",
-                        prev, kind, bor_tag
-                    ));
+            // Only clear prev_borrower on a WRITE through the current borrower. A read
+            // through current is a "peek" (e.g. parent-read, reborrow validation) and must
+            // not evict the child tag stored in prev_borrower — that would permanently kill
+            // any raw pointer whose tag was stashed there by the PoloniusAnchor machinery.
+            if kind == AccessKind::Write {
+                if let Some(prev) = self.prev_borrower {
+                    // Before clearing prev_borrower, check whether it is protected.
+                    // Clearing a protected tag means it can never be accessed again through
+                    // its original handle — that is a protector violation.
+                    if let Some(prot_kind) = protected.get(&prev) {
+                        return Err(format!(
+                            "protector violation: prev_borrower {:?} is {:?}-protected \
+                             but displaced by access through {:?}",
+                            prev, prot_kind, bor_tag
+                        ));
+                    }
+                    self.prev_borrower = None;
                 }
-                self.prev_borrower = None;
             }
             Ok(())
         } else {
             if let Some(prev_tag) = self.prev_borrower {
                 if prev_tag == bor_tag {
+                    // Accessing through prev_borrower. Check if the current active borrower
+                    // is protected — if so, using the older prev tag is a protector violation
+                    // (the protected current tag holds exclusive access).
+                    if let Some(prot_kind) = protected.get(&self.current_borrower) {
+                        return Err(format!(
+                            "protector violation: access via prev_borrower {:?} while \
+                             current_borrower {:?} is {:?}-protected",
+                            bor_tag, self.current_borrower, prot_kind
+                        ));
+                    }
                     println!(
                         "   Access granted: previous borrower {:?} matches access tag {:?}",
                         prev_tag, bor_tag
+                    );
+                    Ok(())
+                } else if kind == AccessKind::Read && self.reborrow_chain.contains(&bor_tag) {
+                    // READ via an intermediate tag retained in reborrow_chain by the inline-anchor
+                    // partial-clear. Raw pointers derived between anchor-restored tags may carry
+                    // these intermediate tags; allowing READ preserves their validity.
+                    println!(
+                        "   Access granted: reborrow_chain READ {:?} (chain: {:?})",
+                        bor_tag, self.reborrow_chain
                     );
                     Ok(())
                 } else {
@@ -124,6 +151,12 @@ impl<'tcx> BorrowerState {
                         self.current_borrower, prev_tag, bor_tag
                     ))
                 }
+            } else if kind == AccessKind::Read && self.reborrow_chain.contains(&bor_tag) {
+                println!(
+                    "   Access granted: reborrow_chain READ {:?} (chain: {:?})",
+                    bor_tag, self.reborrow_chain
+                );
+                Ok(())
             } else {
                 Err(format!(
                     "Access denied: neither current {:?} nor prev borrower exists for access tag {:?}",
@@ -152,6 +185,7 @@ impl<'tcx> BorrowerState {
     fn check_raw_pointer_stack(
         &mut self,
         bor_tag: BorTag,
+        kind: AccessKind,
         protected: &FxHashMap<BorTag, ProtectorKind>,
     ) -> BorrowCheckResult {
         println!("Checking raw pointer stack for access tag {:?}", bor_tag);
@@ -168,11 +202,11 @@ impl<'tcx> BorrowerState {
                     // Before truncating entries above idx, check whether any of them are
                     // protected. Popping a protected raw-stack entry is a protector violation.
                     for displaced in exposed_stack[idx + 1..].iter() {
-                        if let Some(kind) = protected.get(&displaced.current_borrower) {
+                        if let Some(prot_kind) = protected.get(&displaced.current_borrower) {
                             return Err(format!(
                                 "protector violation: raw pointer access through {:?} displaced \
                                  protected tag {:?} ({:?})",
-                                bor_tag, displaced.current_borrower, kind
+                                bor_tag, displaced.current_borrower, prot_kind
                             ));
                         }
                     }
@@ -190,23 +224,42 @@ impl<'tcx> BorrowerState {
                 }
 
                 if entry.base_pointer == bor_tag {
-                    // Check entries that will be popped (above idx, and idx itself if we pop it).
+                    // A READ through the base pointer is non-destructive: the child borrow
+                    // stays live. Only a WRITE reclaims the borrow and kills the child entry.
+                    if kind == AccessKind::Read {
+                        // StrongProtectors fire on any foreign access, including reads.
+                        // A WeakProtector only fires on writes, so reads are fine.
+                        if let Some(ProtectorKind::StrongProtector) = protected.get(&entry.current_borrower) {
+                            return Err(format!(
+                                "protector violation: read through base pointer {:?} while \
+                                 strong-protected child {:?} is active",
+                                bor_tag, entry.current_borrower
+                            ));
+                        }
+                        println!(
+                            "   Raw pointer stack access {:?}: base pointer READ, child {:?} preserved",
+                            bor_tag, entry.current_borrower
+                        );
+                        return Ok(());
+                    }
+
+                    // WRITE: reclaim the borrow — check protectors first.
                     for displaced in exposed_stack[idx + 1..].iter() {
-                        if let Some(kind) = protected.get(&displaced.current_borrower) {
+                        if let Some(prot_kind) = protected.get(&displaced.current_borrower) {
                             return Err(format!(
                                 "protector violation: raw pointer access through {:?} displaced \
                                  protected tag {:?} ({:?})",
-                                bor_tag, displaced.current_borrower, kind
+                                bor_tag, displaced.current_borrower, prot_kind
                             ));
                         }
                     }
                     // Also check the entry at idx itself if it will be popped.
                     if entry.base_pointer != lower_current_borrower {
-                        if let Some(kind) = protected.get(&entry.current_borrower) {
+                        if let Some(prot_kind) = protected.get(&entry.current_borrower) {
                             return Err(format!(
                                 "protector violation: raw pointer base access through {:?} displaced \
                                  protected tag {:?} ({:?})",
-                                bor_tag, entry.current_borrower, kind
+                                bor_tag, entry.current_borrower, prot_kind
                             ));
                         }
                     }
@@ -223,8 +276,8 @@ impl<'tcx> BorrowerState {
                     }
 
                     println!(
-                        "   Raw pointer stack access {:?}: matched base pointer {:?}, lower borrower {:?}",
-                        bor_tag, entry.base_pointer, lower_current_borrower
+                        "   Raw pointer stack access {:?}: base pointer WRITE, reclaimed from {:?}, lower borrower {:?}",
+                        bor_tag, entry.current_borrower, lower_current_borrower
                     );
                     return Ok(());
                 }
@@ -278,9 +331,9 @@ impl<'tcx> BorrowerState {
                             Ok(())
                         } else {
                             if self.exposed_stack.is_some() {
-                                self.check_raw_pointer_stack(bor_tag, protected)
+                                self.check_raw_pointer_stack(bor_tag, kind, protected)
                             } else {
-                                self.check_unique_borrower_tag(bor_tag, protected)
+                                self.check_unique_borrower_tag(bor_tag, kind, protected)
                             }
                         }
                     }
@@ -293,9 +346,9 @@ impl<'tcx> BorrowerState {
             }
             BorrowerPermission::Write =>
                 if self.exposed_stack.is_some() {
-                    self.check_raw_pointer_stack(bor_tag, protected)
+                    self.check_raw_pointer_stack(bor_tag, kind, protected)
                 } else {
-                    self.check_unique_borrower_tag(bor_tag, protected)
+                    self.check_unique_borrower_tag(bor_tag, kind, protected)
                 },
             BorrowerPermission::Frozen =>
                 match kind {
@@ -304,11 +357,11 @@ impl<'tcx> BorrowerState {
                         if shr_tag == bor_tag {
                             Ok(())
                         } else {
-                            self.check_unique_borrower_tag(bor_tag, protected)
+                            self.check_unique_borrower_tag(bor_tag, kind, protected)
                         }
                     }
                     AccessKind::Write => {
-                        self.check_unique_borrower_tag(bor_tag, protected)?;
+                        self.check_unique_borrower_tag(bor_tag, kind, protected)?;
                         self.perms.permission = BorrowerPermission::Write;
                         self.shared_borrower = None;
                         Ok(())
@@ -317,7 +370,7 @@ impl<'tcx> BorrowerState {
             BorrowerPermission::Reserved =>
                 match kind {
                     AccessKind::Read => {
-                        if self.check_unique_borrower_tag(bor_tag, protected).is_ok() {
+                        if self.check_unique_borrower_tag(bor_tag, kind, protected).is_ok() {
                             Ok(())
                         } else {
                             let (shr_tag, _count) = self.shared_borrower.unwrap();
@@ -333,10 +386,69 @@ impl<'tcx> BorrowerState {
                         }
                     }
                     AccessKind::Write => {
-                        self.check_unique_borrower_tag(bor_tag, protected)?;
+                        // Only the reserved tag itself (current_borrower) may activate by writing.
+                        // Any write via a different tag (including prev_borrower) is a foreign
+                        // write that Freeze-type Reserved does not tolerate.
+                        if self.current_borrower != bor_tag {
+                            return Err(format!(
+                                "Access denied: foreign write via {:?} during Reserved borrow \
+                                 (current_borrower = {:?}); only the reserved tag may activate",
+                                bor_tag, self.current_borrower
+                            ));
+                        }
+                        if let Some(prev) = self.prev_borrower {
+                            if let Some(prot_kind) = protected.get(&prev) {
+                                return Err(format!(
+                                    "protector violation: prev_borrower {:?} is {:?}-protected \
+                                     but displaced by Reserved activation via {:?}",
+                                    prev, prot_kind, bor_tag
+                                ));
+                            }
+                            self.prev_borrower = None;
+                        }
                         self.perms.permission = BorrowerPermission::Write;
                         self.shared_borrower = None;
                         Ok(())
+                    }
+                },
+            // Two-phase borrow over a !Freeze type: tolerates foreign writes via shared_borrower.
+            BorrowerPermission::ReservedIM =>
+                match kind {
+                    AccessKind::Read => {
+                        // Identical to Reserved::Read: accept current_borrower or shared_borrower.
+                        if self.check_unique_borrower_tag(bor_tag, kind, protected).is_ok() {
+                            Ok(())
+                        } else {
+                            let (shr_tag, _count) = self.shared_borrower.unwrap();
+                            if shr_tag == bor_tag {
+                                Ok(())
+                            } else {
+                                Err(format!(
+                                    "ReservedIM: read denied for tag {:?} (current={:?}, shared={:?})",
+                                    bor_tag, self.current_borrower, shr_tag
+                                ))
+                            }
+                        }
+                    }
+                    AccessKind::Write => {
+                        if self.check_unique_borrower_tag(bor_tag, kind, protected).is_ok() {
+                            // current_borrower wrote → activation, same as Reserved.
+                            self.perms.permission = BorrowerPermission::Write;
+                            self.shared_borrower = None;
+                            Ok(())
+                        } else if self.shared_borrower.map(|(t, _)| t) == Some(bor_tag) {
+                            // shared_borrower (T0) wrote → foreign write tolerated, stay ReservedIM.
+                            println!(
+                                "ReservedIM: tolerated foreign write via shared_borrower {:?}",
+                                bor_tag
+                            );
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "ReservedIM: write denied for tag {:?} (neither current_borrower {:?} nor shared_borrower {:?})",
+                                bor_tag, self.current_borrower, self.shared_borrower
+                            ))
+                        }
                     }
                 },
         }
@@ -650,7 +762,18 @@ impl BorrowerState {
                     .and_then(<[_]>::last)
                     .map(|e| e.current_borrower)
                     .unwrap_or(self.current_borrower);
-                if effective != tag && !self.reborrow_chain.contains(&tag) {
+                // The tag is still "reachable" if it is:
+                //   1. The effective top-of-stack current borrower, OR
+                //   2. In the Ref-reborrow chain (child reborrow created inside the function), OR
+                //   3. A base_pointer or current_borrower anywhere in the exposed_stack —
+                //      this covers the pattern where foo(x: &mut T) creates a raw-ptr reborrow
+                //      of x and returns it: T_fnentry becomes the exposed_stack base_pointer, and
+                //      the stack's current_borrower advances to the returned child. T_fnentry is
+                //      still the root of the raw-ptr chain, so the allocation is not invalidated.
+                let in_stack = self.exposed_stack.as_deref().map_or(false, |stack| {
+                    stack.iter().any(|e| e.base_pointer == tag || e.current_borrower == tag)
+                });
+                if effective != tag && !self.reborrow_chain.contains(&tag) && !in_stack {
                     throw_ub_format!(
                         "protector violation at frame exit: \
                          tag {:?} in alloc {:?} is no longer the effective current borrower \
@@ -664,8 +787,8 @@ impl BorrowerState {
                 }
                 println!(
                     "[HB] release_protector: implicit read OK for tag {:?} in alloc {:?} \
-                     (effective={:?}, in_chain={})",
-                    tag, alloc_id, effective, self.reborrow_chain.contains(&tag)
+                     (effective={:?}, in_chain={}, in_stack={})",
+                    tag, alloc_id, effective, self.reborrow_chain.contains(&tag), in_stack
                 );
             }
             Some(ProtectorKind::WeakProtector) => {
@@ -721,7 +844,11 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ///
     /// Interacts with: `hb_return_mut_borrower` (delegate), `hb_apply_return_borrowers`
     /// (caller via Polonius anchors), `ReturnBorrowers` in `machine.rs`.
-    fn hb_restore_return_borrower_from_local(&mut self, local: Local) -> InterpResult<'tcx> {
+    fn hb_restore_return_borrower_from_local(
+        &mut self,
+        local: Local,
+        preserve_prev: bool,
+    ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let src = this.local_to_place(local)?;
 
@@ -742,7 +869,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         };
 
         if let ProvenanceExtra::Concrete(bor_tag) = tag {
-            this.hb_return_mut_borrower(alloc_id, bor_tag)?;
+            this.hb_return_mut_borrower(alloc_id, bor_tag, preserve_prev)?;
             println!("Updated return allocation {:?} current_borrower to {:?}", alloc_id, bor_tag);
         }
 
@@ -840,7 +967,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             println!("Found return mut borrowers at {:?}: {:?}", target_loc, mut_locals);
 
             for local in mut_locals {
-                this.hb_restore_return_borrower_from_local(local)?;
+                this.hb_restore_return_borrower_from_local(local, true)?;
             }
         }
 
@@ -851,7 +978,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             );
 
             for local in two_phase_locals {
-                this.hb_restore_return_borrower_from_local(local)?;
+                this.hb_restore_return_borrower_from_local(local, true)?;
             }
         }
 
@@ -873,7 +1000,17 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ///
     /// Interacts with: `hb_restore_return_borrower_from_local` (caller),
     /// `BorrowerPermission::{Read, Frozen, Write}`.
-    fn hb_return_mut_borrower(&mut self, alloc_id: AllocId, new_tag: BorTag) -> InterpResult<'tcx> {
+    fn hb_return_mut_borrower(
+        &mut self,
+        alloc_id: AllocId,
+        new_tag: BorTag,
+        // When true (function-call return): only write prev_borrower if the slot is currently
+        // empty — a raw pointer's tag stashed there by an inline PoloniusAnchor must not be
+        // overwritten by the now-dead callee tag (e.g. T_fnentry).
+        // When false (inline PoloniusAnchor): always overwrite prev_borrower so that scope-end
+        // anchors correctly chain the borrow back to the parent for subsequent writes.
+        preserve_prev: bool,
+    ) -> InterpResult<'tcx> {
         // this return borrower should be called only when it is returning a mut borrow. Therefore, we do need to update state directly
         let this = self.eval_context_mut();
 
@@ -882,9 +1019,20 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.get_alloc_extra(alloc_id)?.borrow_tracker_hb().borrow_mut();
             let old_tag = borrower_state.current_borrower;
             borrower_state.current_borrower = new_tag;
-            borrower_state.prev_borrower = Some(old_tag);
-            // Loan returned via Polonius: the reborrow chain is no longer meaningful since
-            // current_borrower is now the restored parent, not a child reborrow.
+            if preserve_prev {
+                if borrower_state.prev_borrower.is_none() {
+                    borrower_state.prev_borrower = Some(old_tag);
+                }
+            } else {
+                borrower_state.prev_borrower = Some(old_tag);
+                // Keep intermediate chain tags — those displaced by Ref-source reborrows
+                // between new_tag and old_tag. A raw pointer may carry one of these
+                // intermediate tags; retaining it allows READ access via that pointer after
+                // the anchor restores new_tag as current. Tags equal to new_tag or old_tag
+                // are already reachable via current/prev and do not need a chain entry.
+                borrower_state.reborrow_chain.retain(|&t| t != new_tag && t != old_tag);
+                return interp_ok(());
+            }
             borrower_state.reborrow_chain.clear();
 
             // if it is in 'read state', we move it to frozen directly.
@@ -943,6 +1091,10 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         let mut new_prov = Provenance::Concrete { alloc_id, tag: new_tag };
 
+        // Check if the pointee type contains UnsafeCell (i.e., is !Freeze).
+        // Must be computed before borrower_state is taken (split-borrow safety).
+        let ty_is_freeze = place.layout.ty.is_freeze(*this.tcx, this.typing_env());
+
         if let AllocKind::LiveData = this.get_alloc_info(alloc_id).kind {
             let mut borrower_state =
                 this.get_alloc_extra(alloc_id)?.borrow_tracker_hb().borrow_mut();
@@ -964,6 +1116,17 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     )
                 })?;
 
+            // Phase 1: !Freeze shared reborrows inherit the parent tag.
+            // The allocation stays in Write state; no shared_borrower transition occurs.
+            // Multiple &UnsafeCell<T> refs all carry parent_tag (= current_borrower) and
+            // have write authority through the normal Write check — no new state needed.
+            if matches!(perm, NewPermission::Read) && !ty_is_freeze {
+                new_prov = Provenance::Concrete { alloc_id, tag: parent_tag };
+                println!(
+                    "!Freeze shared reborrow: allocation {:?} inherits parent_tag {:?} (no state change)",
+                    alloc_id, parent_tag
+                );
+            } else {
             match borrower_state.perms.permission {
                 // We validate once against the pre-transition state for this reborrow.
                 // If `check_borrower_tag` later starts mutating permissions, we should
@@ -985,15 +1148,19 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         }
                         NewPermission::TwoPhase => {
                             // Same stack logic as Write, but also record the previous effective
-                            // borrower as the shared_borrower and switch to Reserved permission.
+                            // borrower as the shared_borrower and switch to Reserved/ReservedIM.
                             let old_tag = borrower_state
                                 .apply_reborrow_to_stack(parent_tag, new_tag, source, alloc_id)
                                 .map_err(|msg| err_ub_format!("{msg}"))?;
                             borrower_state.shared_borrower = Some((old_tag, 1));
-                            borrower_state.perms.permission = BorrowerPermission::Reserved;
+                            borrower_state.perms.permission =
+                                if ty_is_freeze { BorrowerPermission::Reserved }
+                                else { BorrowerPermission::ReservedIM };
                             println!(
-                                "Updated allocation {:?} to two-phase borrow with tag {:?}. (The stack looks like {:?})",
-                                alloc_id, new_tag, borrower_state.exposed_stack
+                                "Updated allocation {:?} to two-phase borrow ({}) with tag {:?}. (The stack looks like {:?})",
+                                alloc_id,
+                                if ty_is_freeze { "Reserved" } else { "ReservedIM" },
+                                new_tag, borrower_state.exposed_stack
                             );
                         }
                     }
@@ -1041,10 +1208,14 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                             let old_tag = borrower_state.current_borrower;
                             borrower_state.current_borrower = new_tag;
                             borrower_state.shared_borrower = Some((old_tag, 1));
-                            borrower_state.perms.permission = BorrowerPermission::Reserved;
+                            borrower_state.perms.permission =
+                                if ty_is_freeze { BorrowerPermission::Reserved }
+                                else { BorrowerPermission::ReservedIM };
                             println!(
-                                "Updated allocation {:?} to two-phase borrow with tag {:?}",
-                                alloc_id, new_tag
+                                "Updated allocation {:?} to two-phase borrow ({}) with tag {:?}",
+                                alloc_id,
+                                if ty_is_freeze { "Reserved" } else { "ReservedIM" },
+                                new_tag
                             );
                         }
                     },
@@ -1079,14 +1250,54 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                             let old_tag = borrower_state.current_borrower;
                             borrower_state.current_borrower = new_tag;
                             borrower_state.shared_borrower = Some((old_tag, 1));
-                            borrower_state.perms.permission = BorrowerPermission::Reserved;
+                            borrower_state.perms.permission =
+                                if ty_is_freeze { BorrowerPermission::Reserved }
+                                else { BorrowerPermission::ReservedIM };
                             println!(
-                                "Updated allocation {:?} to two-phase borrow with tag {:?}",
+                                "Updated allocation {:?} to two-phase borrow ({}) with tag {:?}",
+                                alloc_id,
+                                if ty_is_freeze { "Reserved" } else { "ReservedIM" },
+                                new_tag
+                            );
+                        }
+                    },
+                BorrowerPermission::ReservedIM =>
+                    match perm {
+                        NewPermission::Read => {
+                            // Inherit the shared_borrower tag (same as Reserved::Read).
+                            let (shr_tag, _count) = borrower_state.shared_borrower.unwrap();
+                            new_prov = Provenance::Concrete { alloc_id, tag: shr_tag };
+                            println!(
+                                "ReservedIM allocation {:?}: Read reborrow inherits shared tag {:?}",
+                                alloc_id, shr_tag
+                            );
+                        }
+                        NewPermission::Write => {
+                            // Activation: identical to Reserved→Write.
+                            let old_cb = borrower_state.current_borrower;
+                            borrower_state.reborrow_chain.push(old_cb);
+                            borrower_state.current_borrower = new_tag;
+                            borrower_state.perms.permission = BorrowerPermission::Write;
+                            println!(
+                                "ReservedIM allocation {:?}: Write activation, new current_borrower {:?}",
+                                alloc_id, new_tag
+                            );
+                        }
+                        NewPermission::TwoPhase => {
+                            let old_tag = borrower_state.current_borrower;
+                            borrower_state.current_borrower = new_tag;
+                            borrower_state.shared_borrower = Some((old_tag, 1));
+                            borrower_state.perms.permission =
+                                if ty_is_freeze { BorrowerPermission::Reserved }
+                                else { BorrowerPermission::ReservedIM };
+                            println!(
+                                "ReservedIM allocation {:?}: nested two-phase borrow with tag {:?}",
                                 alloc_id, new_tag
                             );
                         }
                     },
             }
+            } // end else (Freeze path)
         }
         interp_ok(Some(new_prov))
     }
@@ -1379,12 +1590,22 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // called from this local struct triggers a Rust type-inference issue that
                 // resolves ImmTy<'tcx> as CtfeProvenance instead of Provenance.
                 if is_fn_entry {
-                    if let Some(kind) = hb_protector_for(place.layout.ty) {
-                        if let Some((alloc_id, new_tag)) =
-                            self.ecx.hb_get_ref_alloc_and_tag(&val)?
-                        {
-                            let is_strong = matches!(kind, ProtectorKind::StrongProtector);
-                            self.ecx.hb_register_protector(alloc_id, new_tag, is_strong)?;
+                    // !Freeze shared refs (&T where T: !Freeze) don't get protectors.
+                    // They behave like raw pointers and make no exclusivity promise, so
+                    // blocking foreign writes on them would be overly strict.
+                    let skip_protector = match place.layout.ty.kind() {
+                        ty::Ref(_, inner_ty, ty::Mutability::Not) =>
+                            !inner_ty.is_freeze(*self.ecx.tcx, self.ecx.typing_env()),
+                        _ => false,
+                    };
+                    if !skip_protector {
+                        if let Some(kind) = hb_protector_for(place.layout.ty) {
+                            if let Some((alloc_id, new_tag)) =
+                                self.ecx.hb_get_ref_alloc_and_tag(&val)?
+                            {
+                                let is_strong = matches!(kind, ProtectorKind::StrongProtector);
+                                self.ecx.hb_register_protector(alloc_id, new_tag, is_strong)?;
+                            }
                         }
                     }
                 }
@@ -1625,7 +1846,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             PoloniusAnchorKind::MutReturnBorrower { locals } =>
                 for &local in locals {
                     println!("Polonius anchor for mutable return borrower local {:?}", local);
-                    this.hb_restore_return_borrower_from_local(local)?;
+                    this.hb_restore_return_borrower_from_local(local, false)?;
                 },
             PoloniusAnchorKind::SharedReturnVar { locals } =>
                 for &local in locals {
@@ -1635,12 +1856,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             PoloniusAnchorKind::TwoPhaseReturnBorrower { locals } =>
                 for &local in locals {
                     println!("Polonius anchor for two-phase return borrower local {:?}", local);
-                    this.hb_restore_return_borrower_from_local(local)?;
+                    this.hb_restore_return_borrower_from_local(local, false)?;
                 },
             PoloniusAnchorKind::ReturnRefArgs { locals } =>
                 for &local in locals {
                     println!("Polonius anchor for return ref arg local {:?}", local);
-                    this.hb_restore_return_borrower_from_local(local)?;
+                    this.hb_restore_return_borrower_from_local(local, false)?;
                 },
         }
 
@@ -1780,10 +2001,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 if let AllocKind::LiveData = this.get_alloc_info(alloc_id).kind {
                     let mut state =
                         this.get_alloc_extra(alloc_id)?.borrow_tracker_hb().borrow_mut();
-                    if state.perms.permission == BorrowerPermission::Reserved {
+                    if state.perms.permission == BorrowerPermission::Reserved
+                        || state.perms.permission == BorrowerPermission::ReservedIM
+                    {
                         println!(
-                            "[HB] Activating two-phase borrow: alloc={:?}, tag={:?}: Reserved → Write",
-                            alloc_id, tag
+                            "[HB] Activating two-phase borrow: alloc={:?}, tag={:?}: {:?} → Write",
+                            alloc_id, tag, state.perms.permission
                         );
                         state.perms.permission = BorrowerPermission::Write;
                         state.shared_borrower = None;

@@ -52,9 +52,7 @@ pub fn test4(ref1 : &mut i32, ref2 : &mut i32) {
 
 #[no_mangle]
 pub fn miri_start(_argc: isize, _argv: *const *const u8) -> isize {
-
-    //test3();
     test1();
-
+    test3();
     0
 }

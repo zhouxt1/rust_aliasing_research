@@ -78,6 +78,10 @@ pub struct RawPointerStack {
 /// - `Reserved` — two-phase mutable borrow that has not yet been activated. Reads through the
 ///   reserving tag and through `shared_borrower` are both allowed; activation to `Write`
 ///   happens in `hb_before_terminator` at the call site.
+/// - `ReservedIM` — like `Reserved` but the pointee type contains `UnsafeCell` (`!Freeze`).
+///   Tolerates writes through `shared_borrower` during the reservation window, because a
+///   shared alias of a `Cell`/`RefCell` may legitimately write before the `&mut` activates.
+///   Activation by `current_borrower` works identically to `Reserved`.
 ///
 /// Status: working. See the per-permission branches of `check_borrower_tag`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +90,7 @@ pub enum BorrowerPermission {
     Write,
     Frozen,
     Reserved,
+    ReservedIM,
 }
 
 impl BorrowerState {
