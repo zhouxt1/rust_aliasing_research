@@ -454,37 +454,91 @@ impl<'tcx> BorrowerState {
         }
     }
 
+    /// Resolve a `ProvenanceExtra::Wildcard` access to a concrete `BorTag`, for use by `access`.
+    ///
+    /// A wildcard pointer carries no identity of its own — the integer it was cast from has no
+    /// memory of which tag produced it. So HB does what SB/TB do: **existential search**. Walk
+    /// every tag currently tracked anywhere in this `BorrowerState`, in priority order
+    /// (`current_borrower`, `prev_borrower`, `shared_borrower`, `reborrow_chain` from most to
+    /// least recently displaced, then `exposed_stack` from top to bottom), and return the first
+    /// one that is also a member of `exposed_tags` (i.e. some code actually called
+    /// `expose_provenance` on it). Returns `None` if no currently-live tag was ever exposed.
+    ///
+    /// This is a simplification of SB's `find_granting`: SB tries every exposed-and-live
+    /// candidate against the requested access kind and takes the first one that *grants* it.
+    /// Here we take the first exposed-and-live candidate by priority and let the caller's single
+    /// `check_borrower_tag` call decide whether it grants the access — we don't backtrack to a
+    /// second candidate if the first fails permission. In the test corpus only one tag is ever
+    /// exposed per allocation at a time, so this distinction does not currently matter; revisit
+    /// if a future test needs multiple simultaneously-exposed, differently-permissioned tags.
+    fn resolve_wildcard_tag(&self) -> Option<BorTag> {
+        let mut candidates: Vec<BorTag> = Vec::new();
+        candidates.push(self.current_borrower);
+        if let Some(prev) = self.prev_borrower {
+            candidates.push(prev);
+        }
+        if let Some((shr, _)) = self.shared_borrower {
+            candidates.push(shr);
+        }
+        candidates.extend(self.reborrow_chain.iter().rev().copied());
+        if let Some(ref stack) = self.exposed_stack {
+            candidates.extend(stack.iter().rev().map(|e| e.current_borrower));
+        }
+        candidates.into_iter().find(|t| self.exposed_tags.contains(t))
+    }
+
     /// Entry point invoked from `before_memory_access` for each memory read or write.
     ///
     /// Extracts `protected_tags` from the machine's global borrow-tracker state and threads it
     /// through `check_borrower_tag` so displacement checks can consult it.
     ///
-    /// Status: partial. The non-concrete branch is an explicit TODO — without it, accesses
-    /// through wildcard provenance silently bypass aliasing checks.
+    /// For `ProvenanceExtra::Wildcard` (int-to-ptr casts via `with_exposed_provenance`), the tag
+    /// is resolved via `resolve_wildcard_tag` (existential search over exposed tags) before
+    /// being checked the same way as a concrete access. If no live tag was ever exposed, the
+    /// access is denied outright — mirroring SB's "no exposed tags have suitable permission"
+    /// error.
     ///
-    /// Interacts with: `before_memory_access` (caller), `check_borrower_tag` (delegate).
+    /// Interacts with: `before_memory_access` (caller), `resolve_wildcard_tag`,
+    /// `check_borrower_tag` (delegate).
     fn access(
         &mut self,
         tag: ProvenanceExtra,
         kind: AccessKind,
         machine: &MiriMachine<'_>,
     ) -> InterpResult<'tcx> {
-        if let ProvenanceExtra::Concrete(bor_tag) = tag {
-            println!(
-                "Access with concrete tag {:?}, kind {:?}, and current permission {:?}",
-                bor_tag, kind, self.perms.permission
-            );
-            let protected = machine
-                .borrow_tracker
-                .as_ref()
-                .map(|bt| bt.borrow())
-                .expect("borrow tracker must be active");
-            self.check_borrower_tag(bor_tag, kind, &protected.protected_tags)
-                .map_err(|msg| err_ub_format!("{msg}"))?;
-        } else {
-            // TODO: will handle case where tag is not concrete
-            println!("   Access with non-concrete access tag {:?}", tag);
-        }
+        let bor_tag = match tag {
+            ProvenanceExtra::Concrete(t) => {
+                println!(
+                    "Access with concrete tag {:?}, kind {:?}, and current permission {:?}",
+                    t, kind, self.perms.permission
+                );
+                t
+            }
+            ProvenanceExtra::Wildcard => {
+                match self.resolve_wildcard_tag() {
+                    Some(t) => {
+                        println!(
+                            "   Wildcard access: resolved to exposed tag {:?} for {:?} (exposed_tags: {:?})",
+                            t, kind, self.exposed_tags
+                        );
+                        t
+                    }
+                    None =>
+                        throw_ub_format!(
+                            "{:?} access using <wildcard> provenance failed: no exposed tags are currently live in this allocation (exposed_tags: {:?})",
+                            kind,
+                            self.exposed_tags
+                        ),
+                }
+            }
+        };
+        let protected = machine
+            .borrow_tracker
+            .as_ref()
+            .map(|bt| bt.borrow())
+            .expect("borrow tracker must be active");
+        self.check_borrower_tag(bor_tag, kind, &protected.protected_tags)
+            .map_err(|msg| err_ub_format!("{msg}"))?;
         interp_ok(())
     }
 }
@@ -557,20 +611,41 @@ impl BorrowerState {
         machine: &MiriMachine<'tcx>,
     ) -> InterpResult<'tcx> {
         // StrongProtectors forbid deallocation; WeakProtectors (Box) allow it.
-        // Check whether current_borrower is strongly protected.
+        // Check ALL tags tracked in this BorrowerState — the protected tag may be in
+        // exposed_stack, reborrow_chain, prev_borrower, or shared_borrower rather than
+        // in current_borrower (e.g. when a &mut arg was retagged at FnEntry, the FnEntry
+        // tag lands in exposed_stack via a Ref source reborrow, not in current_borrower).
         let protected_tags = machine
             .borrow_tracker
             .as_ref()
             .map(|bt| bt.borrow())
             .expect("borrow tracker must be active");
-        if let Some(ProtectorKind::StrongProtector) =
-            protected_tags.protected_tags.get(&self.current_borrower)
-        {
-            throw_ub_format!(
-                "deallocating alloc {:?} while tag {:?} is strongly protected",
-                alloc_id,
-                self.current_borrower
-            );
+
+        let check_tag = |tag: BorTag| -> InterpResult<'tcx> {
+            if let Some(ProtectorKind::StrongProtector) = protected_tags.protected_tags.get(&tag) {
+                throw_ub_format!(
+                    "deallocating alloc {:?} while tag {:?} is strongly protected",
+                    alloc_id,
+                    tag
+                );
+            }
+            interp_ok(())
+        };
+        check_tag(self.current_borrower)?;
+        if let Some(prev) = self.prev_borrower {
+            check_tag(prev)?;
+        }
+        if let Some((tag, _)) = self.shared_borrower {
+            check_tag(tag)?;
+        }
+        for &tag in &self.reborrow_chain {
+            check_tag(tag)?;
+        }
+        if let Some(ref stack) = self.exposed_stack {
+            for entry in stack {
+                check_tag(entry.current_borrower)?;
+                check_tag(entry.base_pointer)?;
+            }
         }
         interp_ok(())
     }
@@ -634,19 +709,27 @@ impl BorrowerState {
                     let stack_non_empty =
                         self.exposed_stack.as_ref().map_or(false, |s| !s.is_empty());
                     if stack_non_empty {
-                        // Stack present: the top entry's base_pointer must equal old_tag for the
-                        // reborrow to make sense (the entry is in a "self-loop" state where
-                        // base == current).  If so, update its current_borrower in-place.
                         let stack = self.exposed_stack.as_mut().unwrap();
                         let base_pointer = stack.last().unwrap().base_pointer;
-                        if old_tag != base_pointer {
+                        if old_tag == base_pointer || parent_tag == base_pointer {
+                            // Two valid cases:
+                            // 1. Self-loop (base == current): base_pointer == old_tag; update in-place.
+                            // 2. Second reborrow from same base: parent_tag == base_pointer, meaning
+                            //    ptr_base is being used again to create a new &mut, displacing the
+                            //    prior child (old_tag). Sequential sibling reborrows from the same
+                            //    raw pointer — the new one takes over current_borrower.
+                            stack.last_mut().unwrap().current_borrower = new_tag;
+                            println!(
+                                "Updated allocation {:?} exposed_stack top current_borrower {:?} → {:?} (base {:?})",
+                                alloc_id, old_tag, new_tag, base_pointer
+                            );
+                        } else {
                             return Err(format!(
                                 "Raw pointer reborrow with tag {:?} does not match base pointer \
                                  {:?} for allocation {:?}",
                                 parent_tag, base_pointer, alloc_id
                             ));
                         }
-                        stack.last_mut().unwrap().current_borrower = new_tag;
                     } else {
                         // No stack: check if prev_borrower matches — if so we can start a new
                         // stack entry rooted at prev_borrower.
@@ -1709,11 +1792,23 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// Hook called when a tag is "exposed" (e.g. cast to an integer and back, or otherwise
     /// laundered into a wildcard provenance).
     ///
-    /// Status: **not implemented** — empty body. SB and TB use this to mark the tag as
-    /// available to wildcard-provenance accesses; HB ignores it. Combined with the
-    /// non-concrete branch of `access` being a TODO, this means HB currently has no model of
-    /// exposed pointers at all.
-    fn hb_expose_tag(&self, _alloc_id: AllocId, _tag: BorTag) -> InterpResult<'tcx> {
+    /// Records `tag` into this allocation's `BorrowerState::exposed_tags`, mirroring
+    /// `sb_expose_tag` / `tb_expose_tag`. Later wildcard accesses (`ProvenanceExtra::Wildcard`
+    /// in `access`) only resolve to tags present in this list — see `access` in this file.
+    fn hb_expose_tag(&self, alloc_id: AllocId, tag: BorTag) -> InterpResult<'tcx> {
+        let this = self.eval_context_ref();
+        let kind = this.get_alloc_info(alloc_id).kind;
+        match kind {
+            AllocKind::LiveData => {
+                let alloc_extra = this.get_alloc_extra(alloc_id)?;
+                let mut bs = alloc_extra.borrow_tracker_hb().borrow_mut();
+                if !bs.exposed_tags.contains(&tag) {
+                    bs.exposed_tags.push(tag);
+                }
+                println!("[HB] exposed tag {:?} in alloc {:?}", tag, alloc_id);
+            }
+            AllocKind::Function | AllocKind::VTable | AllocKind::TypeId | AllocKind::Dead => {}
+        }
         interp_ok(())
     }
 

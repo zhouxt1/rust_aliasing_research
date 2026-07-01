@@ -39,6 +39,13 @@ pub struct BorrowerState {
     /// effective borrower is a descendant (not an alias) of the protected tag.
     pub reborrow_chain: Vec<BorTag>,
 
+    /// Tags that have been exposed via `expose_provenance` (int-to-ptr laundering) on this
+    /// allocation. Almost always 0 or 1 entries in practice, so a `Vec` (no hashing overhead,
+    /// no heap allocation until first push) is used instead of a `HashSet`. Consulted by
+    /// wildcard memory accesses: a wildcard pointer resolves to whichever live tag is both
+    /// still tracked in this `BorrowerState` and present here — see `access` in `mod.rs`.
+    pub exposed_tags: Vec<BorTag>,
+
     pub perms: LocationState,
 }
 
@@ -108,6 +115,7 @@ impl BorrowerState {
             shared_borrower: None,
             exposed_stack: None,
             reborrow_chain: Vec::new(),
+            exposed_tags: Vec::new(),
             perms: LocationState { permission: BorrowerPermission::Write },
         }
     }
