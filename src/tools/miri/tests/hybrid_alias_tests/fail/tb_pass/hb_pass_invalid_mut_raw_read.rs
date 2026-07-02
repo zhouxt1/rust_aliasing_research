@@ -8,6 +8,15 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+/// REGRESSED (2026-07-02): moved here from pass/sb_fail/ after the `RawPointerStack.dead` fix
+/// (see COVERAGE.md's "pass/sb_tb_fail case study" — this was the file used to hand-diagnose
+/// the regression's root cause via debug trace). `xref` is never written to before `*xraw`, so
+/// it is TB-Reserved throughout and TB tolerates the parent read. HB's binary `dead` flag kills
+/// `xref`'s entry unconditionally on `*xraw`, so `foo(xref)`'s FnEntry retag now fails the same
+/// way SB's does. Needs the deferred `activated` field (only kill on parent read once the entry
+/// has been self-written) to distinguish this from the genuinely-activated case that SB/TB/HB
+/// all agree should fail (see `hb_tb_pass_invalid_mut_write.rs`).
+///
 /// An inline parent-raw READ does not invalidate a child `&mut` for function passing in HB.
 ///
 /// ## Source
@@ -39,7 +48,7 @@ fn panic(_info: &PanicInfo) -> ! {
 /// |-------|---------|--------|
 /// | SB    | **fail**| `*xraw` pops `xref`'s Unique item; FnEntry retag fails |
 /// | TB    | pass    | TB: `xref` is Reserved, parent read does not disable Reserved |
-/// | HB    | pass    | Base-pointer READ does not truncate exposed_stack |
+/// | HB    | **fail**| (post-fix regression) Base-pointer READ kills xref unconditionally |
 #[inline(never)]
 fn foo(_x: &mut i32) {
     // Just consume the reference — verifies FnEntry retag succeeds.

@@ -8,6 +8,14 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+/// REGRESSED (2026-07-02): moved here from pass/sb_fail/ after the `RawPointerStack.dead` fix
+/// (see COVERAGE.md's "pass/sb_tb_fail case study"). `xref` is never written to before the
+/// callee's `&*xraw` shared reborrow (only read, at the very end) — i.e. it is TB-Reserved the
+/// whole time, and TB tolerates foreign reads/reborrows on Reserved nodes. HB's binary `dead`
+/// flag has no such distinction: the callee's `&*xraw` is treated as a read through the base
+/// pointer and kills `xref`'s entry unconditionally, so `*xref` after the call now fails. This
+/// is exactly the missing Reserved-vs-Active split tracked as the deferred `activated` field.
+///
 /// A callee creating a shared reference from the parent raw pointer does NOT invalidate
 /// a child `&mut` derived from that same raw pointer in HB.
 ///
@@ -47,8 +55,8 @@ fn panic(_info: &PanicInfo) -> ! {
 /// | Model | Verdict | Reason |
 /// |-------|---------|--------|
 /// | SB    | **fail**| SRO reborrow in callee pops T_xref's Unique item |
-/// | TB    | pass    | TB preserves children across read-only reborrows |
-/// | HB    | pass    | exposed_stack top updated but T_xref restored on callee return |
+/// | TB    | pass    | TB preserves children across read-only reborrows (xref is Reserved) |
+/// | HB    | **fail**| (post-fix regression) callee's `&*xraw` kills xref's entry unconditionally |
 fn callee_creates_shared_ref_from_raw(xraw: *mut i32) {
     // Deliberately uses shared reference (not direct read) to distinguish from illegal_read1.
     let shr = unsafe { &*xraw }; // shared reborrow from the raw pointer

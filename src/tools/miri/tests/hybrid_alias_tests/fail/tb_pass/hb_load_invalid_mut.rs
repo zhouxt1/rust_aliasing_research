@@ -9,6 +9,14 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+/// REGRESSED (2026-07-02): moved here from pass/sb_fail/ after the `RawPointerStack.dead` fix
+/// (see COVERAGE.md's "pass/sb_tb_fail case study"). `xref` is never written to (Reserved the
+/// whole time in TB terms), so TB's foreign-read-on-Reserved tolerance lets it survive `*xraw`.
+/// HB's binary `dead` flag has no such distinction: `*xraw` kills `xref`'s exposed_stack entry
+/// unconditionally, so the later reborrow of `xref_ptr` (whose parent tag is now dead) fails
+/// with "invalid parent tag" instead of succeeding. Fixing this needs the deferred `activated`
+/// field (only kill on parent read once the entry has been self-written).
+///
 /// Loading a `&mut` from a stack slot after the pointer was "invalidated" by a lower-level
 /// raw-pointer access fails in Stacked Borrows but passes in HB and TB.
 ///
@@ -62,7 +70,7 @@ fn panic(_info: &PanicInfo) -> ! {
 /// |-------|---------|--------|
 /// | SB    | **fail**| `*xraw` pops T_xref; subsequent retag of T_xref fails |
 /// | TB    | **pass**| Foreign reads keep Reserved nodes alive; T_xref reactivates |
-/// | HB    | **pass**| PoloniusAnchor restores T_xraw; no pop-on-lower-access semantics |
+/// | HB    | **fail**| (post-fix regression) `*xraw` kills xref's entry; later reborrow denied |
 #[no_mangle]
 pub fn miri_start(_argc: isize, _argv: *const *const u8) -> isize {
     let mut x = 42i32;

@@ -8,6 +8,19 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+/// STILL UNFIXED (2026-07-02) after the `RawPointerStack.dead` fix — see COVERAGE.md's
+/// "pass/sb_tb_fail case study" for why. Unlike the 5 tests that *were* fixed by that change,
+/// this one uses a bare `mref as *mut u8` cast rather than a `&mut *raw_ptr` reborrow. Per the
+/// existing code comment in `mod.rs` ("Like SB, raw pointers are only retagged for
+/// `RetagKind::Raw`"), casting FROM an existing `&mut` does not create any new tracked identity
+/// at all — `ptr` just carries `T_mref` directly (`BorrowerState.current_borrower`), and no
+/// `RawPointerStack` entry is ever pushed. The `dead`-on-parent-read fix only applies to
+/// `RawPointerStack` entries, so it has nothing to act on here: there is no separate
+/// "child" tag distinct from `current_borrower` for a parent read to kill. Fixing this test
+/// would require a deeper structural change — making bare-cast raw pointers trackable in their
+/// own right, distinct from the plain-reference `current_borrower` model — not just the
+/// `RawPointerStack`-local fix implemented so far.
+///
 /// A parent read does NOT kill a raw pointer derived from a child reborrow in HB.
 ///
 /// ## Source

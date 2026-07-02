@@ -169,19 +169,27 @@ impl<'tcx> BorrowerState {
     /// Validate `bor_tag` against the raw-pointer exposed stack and `current_borrower`.
     ///
     /// Walks `exposed_stack` from the top down. Two ways to accept:
-    /// 1. `bor_tag` matches an entry's `current_borrower` — entries above are popped (siblings
-    ///    derived later are invalidated by the access through this older one).
+    /// 1. `bor_tag` matches an entry's `raw_pointer_borrower` — if the entry is `dead`, the
+    ///    access is denied outright (read or write). Otherwise entries above are popped
+    ///    (siblings derived later are invalidated by the access through this older one).
     /// 2. `bor_tag` matches an entry's `base_pointer` — accepts an access through the original
-    ///    parent of a raw chain; if the `base_pointer` differs from the lower-level current
+    ///    parent of a raw chain. A **read** here is a "parent read": it succeeds, but marks
+    ///    this entry and everything above it `dead` (only a subsequent **write** through the
+    ///    base can revive access to that memory, via the reclaim path below). A **write**
+    ///    reclaims the borrow and physically removes the entry (and everything above it) from
+    ///    the stack, same as before; if the `base_pointer` differs from the lower-level current
     ///    borrower, it's stashed into `prev_borrower` for a possible follow-up access through
     ///    the parent.
     /// Falls back to a direct `current_borrower == bor_tag` check at the bottom of the stack.
     ///
-    /// Status: working for the patterns covered by `pass/test1.rs` and `pass/test6.rs`. The
-    /// stack truncation logic is the load-bearing piece of raw-pointer aliasing in HB.
+    /// Status: working for the patterns covered by `pass/test1.rs` and `pass/test6.rs`, plus the
+    /// `pass/sb_tb_fail/` corpus (parent-read-then-child-write patterns that both SB and TB
+    /// reject). The stack truncation logic is the load-bearing piece of raw-pointer aliasing in
+    /// HB.
     ///
     /// Interacts with: `check_borrower_tag` (the dispatcher), `apply_reborrow_to_stack` (which
-    /// pushes entries this method later consumes).
+    /// pushes entries this method later consumes, and revives dead ones on a fresh reborrow from
+    /// the same base pointer).
     fn check_raw_pointer_stack(
         &mut self,
         bor_tag: BorTag,
@@ -193,20 +201,29 @@ impl<'tcx> BorrowerState {
             for idx in (0..exposed_stack.len()).rev() {
                 let entry = exposed_stack[idx].clone();
                 let lower_current_borrower = if idx > 0 {
-                    exposed_stack[idx - 1].current_borrower
+                    exposed_stack[idx - 1].raw_pointer_borrower
                 } else {
                     self.current_borrower
                 };
 
-                if entry.current_borrower == bor_tag {
+                if entry.raw_pointer_borrower == bor_tag {
+                    if entry.dead {
+                        return Err(format!(
+                            "Access denied: tag {:?} was killed by an earlier read through its \
+                             base pointer {:?} (parent read invalidates the child; only a write \
+                             through the base pointer can reclaim the borrow)",
+                            bor_tag, entry.base_pointer
+                        ));
+                    }
+
                     // Before truncating entries above idx, check whether any of them are
                     // protected. Popping a protected raw-stack entry is a protector violation.
                     for displaced in exposed_stack[idx + 1..].iter() {
-                        if let Some(prot_kind) = protected.get(&displaced.current_borrower) {
+                        if let Some(prot_kind) = protected.get(&displaced.raw_pointer_borrower) {
                             return Err(format!(
                                 "protector violation: raw pointer access through {:?} displaced \
                                  protected tag {:?} ({:?})",
-                                bor_tag, displaced.current_borrower, prot_kind
+                                bor_tag, displaced.raw_pointer_borrower, prot_kind
                             ));
                         }
                     }
@@ -217,49 +234,54 @@ impl<'tcx> BorrowerState {
                     }
 
                     println!(
-                        "   Raw pointer stack access {:?}: matched current borrower {:?}, base {:?}, lower borrower {:?}",
-                        bor_tag, entry.current_borrower, entry.base_pointer, lower_current_borrower
+                        "   Raw pointer stack access {:?}: matched raw_pointer_borrower {:?}, base {:?}, lower borrower {:?}",
+                        bor_tag, entry.raw_pointer_borrower, entry.base_pointer, lower_current_borrower
                     );
                     return Ok(());
                 }
 
                 if entry.base_pointer == bor_tag {
-                    // A READ through the base pointer is non-destructive: the child borrow
-                    // stays live. Only a WRITE reclaims the borrow and kills the child entry.
+                    // A READ through the base pointer is a "parent read": it succeeds, but
+                    // kills this entry and everything above it (binary dead state, not TB's
+                    // softer Frozen — no further read or write through them is permitted until
+                    // a fresh reborrow from this same base pointer revives the slot).
                     if kind == AccessKind::Read {
                         // StrongProtectors fire on any foreign access, including reads.
                         // A WeakProtector only fires on writes, so reads are fine.
-                        if let Some(ProtectorKind::StrongProtector) = protected.get(&entry.current_borrower) {
+                        if let Some(ProtectorKind::StrongProtector) = protected.get(&entry.raw_pointer_borrower) {
                             return Err(format!(
                                 "protector violation: read through base pointer {:?} while \
                                  strong-protected child {:?} is active",
-                                bor_tag, entry.current_borrower
+                                bor_tag, entry.raw_pointer_borrower
                             ));
                         }
+                        for e in &mut exposed_stack[idx..] {
+                            e.dead = true;
+                        }
                         println!(
-                            "   Raw pointer stack access {:?}: base pointer READ, child {:?} preserved",
-                            bor_tag, entry.current_borrower
+                            "   Raw pointer stack access {:?}: base pointer READ, child {:?} and above killed (dead)",
+                            bor_tag, entry.raw_pointer_borrower
                         );
                         return Ok(());
                     }
 
                     // WRITE: reclaim the borrow — check protectors first.
                     for displaced in exposed_stack[idx + 1..].iter() {
-                        if let Some(prot_kind) = protected.get(&displaced.current_borrower) {
+                        if let Some(prot_kind) = protected.get(&displaced.raw_pointer_borrower) {
                             return Err(format!(
                                 "protector violation: raw pointer access through {:?} displaced \
                                  protected tag {:?} ({:?})",
-                                bor_tag, displaced.current_borrower, prot_kind
+                                bor_tag, displaced.raw_pointer_borrower, prot_kind
                             ));
                         }
                     }
                     // Also check the entry at idx itself if it will be popped.
                     if entry.base_pointer != lower_current_borrower {
-                        if let Some(prot_kind) = protected.get(&entry.current_borrower) {
+                        if let Some(prot_kind) = protected.get(&entry.raw_pointer_borrower) {
                             return Err(format!(
                                 "protector violation: raw pointer base access through {:?} displaced \
                                  protected tag {:?} ({:?})",
-                                bor_tag, entry.current_borrower, prot_kind
+                                bor_tag, entry.raw_pointer_borrower, prot_kind
                             ));
                         }
                     }
@@ -277,7 +299,7 @@ impl<'tcx> BorrowerState {
 
                     println!(
                         "   Raw pointer stack access {:?}: base pointer WRITE, reclaimed from {:?}, lower borrower {:?}",
-                        bor_tag, entry.current_borrower, lower_current_borrower
+                        bor_tag, entry.raw_pointer_borrower, lower_current_borrower
                     );
                     return Ok(());
                 }
@@ -482,7 +504,8 @@ impl<'tcx> BorrowerState {
         }
         candidates.extend(self.reborrow_chain.iter().rev().copied());
         if let Some(ref stack) = self.exposed_stack {
-            candidates.extend(stack.iter().rev().map(|e| e.current_borrower));
+            // A dead entry can't be used for anything, so it's not a valid wildcard target.
+            candidates.extend(stack.iter().rev().filter(|e| !e.dead).map(|e| e.raw_pointer_borrower));
         }
         candidates.into_iter().find(|t| self.exposed_tags.contains(t))
     }
@@ -643,7 +666,9 @@ impl BorrowerState {
         }
         if let Some(ref stack) = self.exposed_stack {
             for entry in stack {
-                check_tag(entry.current_borrower)?;
+                // Scanned regardless of `dead` — a protected tag doesn't stop being protected
+                // just because an unrelated foreign read happened elsewhere.
+                check_tag(entry.raw_pointer_borrower)?;
                 check_tag(entry.base_pointer)?;
             }
         }
@@ -689,7 +714,7 @@ impl BorrowerState {
             .exposed_stack
             .as_deref()
             .and_then(<[_]>::last)
-            .map(|e| e.current_borrower)
+            .map(|e| e.raw_pointer_borrower)
             .unwrap_or(self.current_borrower);
 
         match source {
@@ -697,9 +722,11 @@ impl BorrowerState {
                 if old_tag == parent_tag {
                     // Parent matches the effective current borrower: push a new stack entry that
                     // records the old tag as the base and the new tag as the current borrower.
-                    self.exposed_stack
-                        .get_or_insert_with(Vec::new)
-                        .push(RawPointerStack { base_pointer: old_tag, current_borrower: new_tag });
+                    self.exposed_stack.get_or_insert_with(Vec::new).push(RawPointerStack {
+                        base_pointer: old_tag,
+                        raw_pointer_borrower: new_tag,
+                        dead: false,
+                    });
                     println!(
                         "Updated allocation {:?} exposed_stack to {:?}",
                         alloc_id, self.exposed_stack
@@ -718,9 +745,13 @@ impl BorrowerState {
                             //    ptr_base is being used again to create a new &mut, displacing the
                             //    prior child (old_tag). Sequential sibling reborrows from the same
                             //    raw pointer — the new one takes over current_borrower.
-                            stack.last_mut().unwrap().current_borrower = new_tag;
+                            // Either way this is a *fresh* reborrow from the base pointer, so it
+                            // revives the slot even if a prior parent read had killed it.
+                            let top = stack.last_mut().unwrap();
+                            top.raw_pointer_borrower = new_tag;
+                            top.dead = false;
                             println!(
-                                "Updated allocation {:?} exposed_stack top current_borrower {:?} → {:?} (base {:?})",
+                                "Updated allocation {:?} exposed_stack top raw_pointer_borrower {:?} → {:?} (base {:?}, revived)",
                                 alloc_id, old_tag, new_tag, base_pointer
                             );
                         } else {
@@ -735,12 +766,13 @@ impl BorrowerState {
                         // stack entry rooted at prev_borrower.
                         match self.prev_borrower {
                             Some(prev_tag) if prev_tag == parent_tag => {
-                                self.exposed_stack
-                                    .get_or_insert_with(Vec::new)
-                                    .push(RawPointerStack {
+                                self.exposed_stack.get_or_insert_with(Vec::new).push(
+                                    RawPointerStack {
                                         base_pointer: prev_tag,
-                                        current_borrower: new_tag,
-                                    });
+                                        raw_pointer_borrower: new_tag,
+                                        dead: false,
+                                    },
+                                );
                                 println!(
                                     "Updated allocation {:?} exposed_stack to {:?}",
                                     alloc_id, self.exposed_stack
@@ -764,9 +796,14 @@ impl BorrowerState {
                 println!("exposed stack is {:?}", self.exposed_stack);
                 if let Some(stack) = self.exposed_stack.as_mut() {
                     if let Some(top) = stack.last_mut() {
-                        top.current_borrower = new_tag;
+                        // Just renaming the same slot's tag — this is NOT a fresh reborrow from
+                        // the base pointer, so `dead` is deliberately left untouched. If the
+                        // slot was killed by a parent read, writing through the renamed tag
+                        // must still be denied (e.g. an FnEntry retag of an already-dead &mut
+                        // parameter does not resurrect it).
+                        top.raw_pointer_borrower = new_tag;
                         println!(
-                            "Updated allocation {:?} current_borrower to {:?} in Stack",
+                            "Updated allocation {:?} raw_pointer_borrower to {:?} in Stack",
                             alloc_id, new_tag
                         );
                     }
@@ -834,27 +871,33 @@ impl BorrowerState {
                 // we record it in `reborrow_chain` instead.
                 //
                 // When the function argument was raw-pointer-derived, the tag lives in
-                // `exposed_stack.last().current_borrower` rather than `current_borrower`. If
+                // `exposed_stack.last().raw_pointer_borrower` rather than `current_borrower`. If
                 // something corrupted the allocation (e.g. a write through the raw base
                 // pointer), the stack entry gets popped and the effective borrower will differ
                 // from `tag` — and `reborrow_chain` will not contain `tag` either, so the
                 // violation is still caught.
+                //
+                // NOTE: this does not currently check `RawPointerStack::dead` (a `tag` that
+                // matches a *dead* entry's `raw_pointer_borrower` is still treated as
+                // "reachable" here). None of the corpus's protector tests exercise a parent
+                // read immediately followed by frame exit, so this is left as-is rather than
+                // speculatively tightened; revisit if a test needs it.
                 let effective = self
                     .exposed_stack
                     .as_deref()
                     .and_then(<[_]>::last)
-                    .map(|e| e.current_borrower)
+                    .map(|e| e.raw_pointer_borrower)
                     .unwrap_or(self.current_borrower);
                 // The tag is still "reachable" if it is:
                 //   1. The effective top-of-stack current borrower, OR
                 //   2. In the Ref-reborrow chain (child reborrow created inside the function), OR
-                //   3. A base_pointer or current_borrower anywhere in the exposed_stack —
+                //   3. A base_pointer or raw_pointer_borrower anywhere in the exposed_stack —
                 //      this covers the pattern where foo(x: &mut T) creates a raw-ptr reborrow
                 //      of x and returns it: T_fnentry becomes the exposed_stack base_pointer, and
                 //      the stack's current_borrower advances to the returned child. T_fnentry is
                 //      still the root of the raw-ptr chain, so the allocation is not invalidated.
                 let in_stack = self.exposed_stack.as_deref().map_or(false, |stack| {
-                    stack.iter().any(|e| e.base_pointer == tag || e.current_borrower == tag)
+                    stack.iter().any(|e| e.base_pointer == tag || e.raw_pointer_borrower == tag)
                 });
                 if effective != tag && !self.reborrow_chain.contains(&tag) && !in_stack {
                     throw_ub_format!(
@@ -1445,12 +1488,12 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let bs = this.get_alloc_extra(alloc_id)?.borrow_tracker_hb().borrow();
                 // Use the *effective* current borrower: when a raw-pointer stack is present
                 // (e.g. the arg was derived via `&mut *raw_ptr`), the freshly-minted tag
-                // lives in `exposed_stack.last().current_borrower`, not in `current_borrower`.
+                // lives in `exposed_stack.last().raw_pointer_borrower`, not in `current_borrower`.
                 let tag = bs
                     .exposed_stack
                     .as_deref()
                     .and_then(<[_]>::last)
-                    .map(|e| e.current_borrower)
+                    .map(|e| e.raw_pointer_borrower)
                     .unwrap_or(bs.current_borrower);
                 return interp_ok(Some((alloc_id, tag)));
             }

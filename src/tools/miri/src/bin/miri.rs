@@ -280,7 +280,15 @@ fn compute_retags<'tcx>(
     //let basic_blocks = body.basic_blocks.as_mut();
     let local_decls = &body.local_decls;
     let needs_retag = |place: &Place<'tcx>| {
-        !place.is_indirect_first_projection()
+        // NOTE: `is_indirect_first_projection` asserts that `Deref` only ever appears as the
+        // first projection element — an invariant that only holds from `AnalysisPhase::PostCleanup`
+        // onward. This function runs on the *raw* borrowck body (before
+        // `run_analysis_to_runtime_passes`), where a `Deref` can legitimately appear elsewhere in
+        // the projection chain (e.g. closure-capture desugaring combined with a dereferenced
+        // parameter). Use the general `is_indirect` instead — the doc comment on
+        // `is_indirect_first_projection` confirms the two are equivalent once cleanup has run;
+        // `is_indirect` is just the (always-correct) version that also works before then.
+        !place.is_indirect()
             && may_contain_reference(place.ty(local_decls, tcx).ty, 3, tcx)
             && !local_decls[place.local].is_deref_temp()
     };

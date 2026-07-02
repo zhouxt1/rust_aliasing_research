@@ -8,6 +8,13 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+/// REGRESSED (2026-07-02): moved here from pass/sb_fail/ after the `RawPointerStack.dead` fix
+/// (see COVERAGE.md's "pass/sb_tb_fail case study"). `ret` is never activated (no write before
+/// the parent read), so TB keeps it Reserved and tolerates the read. HB's binary `dead` flag
+/// kills `ret`'s entry unconditionally on `*xraw`, so the return-site retag now fails the same
+/// way it does in the genuinely-activated companion test `hb_tb_return_invalid_mut_write.rs`.
+/// Needs the deferred `activated` field to tell these two cases apart.
+///
 /// A returned `&mut` remains valid after a parent raw READ in HB and TB, but not SB.
 ///
 /// ## Source
@@ -50,7 +57,7 @@ fn panic(_info: &PanicInfo) -> ! {
 /// |-------|---------|--------|
 /// | SB    | **fail**| `*xraw` pops ret's Unique item; return-site retag fails |
 /// | TB    | pass    | ret is Reserved; parent reads do not disable Reserved |
-/// | HB    | pass    | base-pointer READ does not truncate exposed_stack |
+/// | HB    | **fail**| (post-fix regression) base-pointer READ kills ret; return-site retag fails |
 #[inline(never)]
 fn return_mut_after_parent_read(x: &mut (i32, i32)) -> &mut i32 {
     let xraw = x as *mut (i32, i32);

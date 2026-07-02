@@ -8,6 +8,12 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+/// REGRESSED (2026-07-02): moved here from pass/sb_fail/ after the `RawPointerStack.dead` fix
+/// (see COVERAGE.md's "pass/sb_tb_fail case study"; near-duplicate of
+/// `hb_return_invalid_mut_raw_read.rs`). `ret` is never activated before `*xraw`, so TB keeps
+/// it Reserved and tolerates the read. HB's binary `dead` flag kills `ret`'s entry
+/// unconditionally, so the return-site retag now fails. Needs the deferred `activated` field.
+///
 /// Returning a `&mut` that was only shadowed by a parent READ is valid in HB.
 ///
 /// ## Source
@@ -32,10 +38,10 @@ fn panic(_info: &PanicInfo) -> ! {
 /// pops `ret`'s Unique item off the stack. Even a READ pops Unique items in SB. The
 /// subsequent retag of `ret` at the return site finds its tag gone → UB.
 ///
-/// ## Key HB design choice
+/// ## Key HB design choice (pre-fix; now outdated — see REGRESSED note above)
 ///
-/// Parent reads do not kill children in HB. This is consistent with
-/// `sb_raw_read_doesnt_kill_child_mut.rs` and mirrors Tree Borrows semantics.
+/// Parent reads used to not kill children in HB. Post-fix, they do (unconditionally), which
+/// is what causes this regression.
 fn foo(x: &mut (i32, i32)) -> &mut i32 {
     let xraw = x as *mut (i32, i32); // carries T_x
     let ret = unsafe { &mut (*xraw).1 }; // RawPtr reborrow: T_ret, stack [{T_x, T_ret}]

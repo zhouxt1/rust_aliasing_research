@@ -8,6 +8,16 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+/// STILL UNFIXED (2026-07-02) after the `RawPointerStack.dead` fix — see COVERAGE.md's
+/// "pass/sb_tb_fail case study" for why. This test's mechanism is not even a parent-read case:
+/// `z = &mut x as *mut i32` is a bare cast (per `mod.rs`'s "raw pointers are only retagged for
+/// `RetagKind::Raw`" comment), so `z` carries `T_z = current_borrower` directly — no
+/// `RawPointerStack` entry ever exists here for the `dead` flag to act on. The actual gap is
+/// that HB's plain `current_borrower`/`prev_borrower` displacement mechanism (used for FnEntry
+/// retags) never disables/freezes a displaced `prev_borrower` on a foreign write the way TB's
+/// Active→Disabled transition does. Fixing this would mean changing how FnEntry retags
+/// interact with `prev_borrower`, independent of anything in the `RawPointerStack` fix.
+///
 /// Writing through a raw pointer, calling a function that reborrows it, then writing again
 /// is valid in HB. Tree Borrows fails this; Stacked Borrows also fails it.
 ///

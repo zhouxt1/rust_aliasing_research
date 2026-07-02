@@ -14,7 +14,8 @@ use crate::borrow_tracker::BorTag;
 ///   borrows share one tag and bump the count.
 /// - `exposed_stack` — when an `&mut` is observed through a raw pointer (`&mut *raw`), the
 ///   chain is recorded here as a stack of `RawPointerStack` entries instead of clobbering
-///   `current_borrower`.
+///   `current_borrower`. A **read** through an entry's `base_pointer` (a "parent read") marks
+///   that entry (and everything above it) `dead` — see `RawPointerStack` for details.
 /// - `reborrow_chain` — the sequence of tags displaced from `current_borrower` by Ref-source
 ///   child reborrows (most recently displaced is at the end). Used by `release_protector` to
 ///   recognize that a protected tag is still a valid ancestor of the effective current borrower
@@ -62,17 +63,28 @@ pub struct LocationState {
 /// One frame of the raw-pointer-derived borrow chain.
 ///
 /// When code does `let m = &mut *raw_ptr`, the new mutable borrow `m` is recorded by pushing
-/// a `RawPointerStack { base_pointer, current_borrower }` onto `BorrowerState.exposed_stack`,
-/// where `base_pointer` is the tag the raw was originally derived from and `current_borrower`
-/// is the freshly-minted tag for `m`. Subsequent accesses through `m`, through siblings of
-/// `m`, or back through the underlying mutable, are validated by walking this stack.
+/// a `RawPointerStack { base_pointer, raw_pointer_borrower, dead: false }` onto
+/// `BorrowerState.exposed_stack`, where `base_pointer` is the tag the raw was originally
+/// derived from and `raw_pointer_borrower` is the freshly-minted tag for `m` (named to avoid
+/// confusion with `BorrowerState.current_borrower`, which is the allocation-wide owner, not a
+/// per-entry one). Subsequent accesses through `m`, through siblings of `m`, or back through
+/// the underlying mutable, are validated by walking this stack.
+///
+/// `dead` — set when a **read** through this entry's `base_pointer` occurs (a "parent read").
+/// Once dead, *any* access (read or write) through `raw_pointer_borrower` is denied — this is
+/// deliberately a binary alive/dead state, not TB's softer Frozen (which still permits reads).
+/// A fresh reborrow from the same `base_pointer` (`apply_reborrow_to_stack`'s "second reborrow
+/// from the same base" case) revives the slot by resetting `dead = false`; a plain `Ref`-source
+/// retag that just renames `raw_pointer_borrower` in place does *not* reset it, since that's
+/// still logically the same (dead) borrow wearing a new tag.
 ///
 /// Status: working; see `apply_reborrow_to_stack` and `check_raw_pointer_stack` in
-/// `hybrid_borrows/mod.rs` for how entries are pushed and consulted.
+/// `hybrid_borrows/mod.rs` for how entries are pushed, killed, revived, and consulted.
 #[derive(Debug, Clone)]
 pub struct RawPointerStack {
     pub base_pointer: BorTag,
-    pub current_borrower: BorTag,
+    pub raw_pointer_borrower: BorTag,
+    pub dead: bool,
 }
 
 /// Permission lattice for `BorrowerState`.

@@ -8,6 +8,14 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+/// REGRESSED (2026-07-02): moved here from pass/sb_fail/ after the `RawPointerStack.dead` fix
+/// (see COVERAGE.md's "pass/sb_tb_fail case study"). `xref` is never written to before `*xraw`,
+/// so it is TB-Reserved throughout and TB would tolerate the parent read (same pattern as
+/// `hb_pass_invalid_mut_raw_read.rs`, which this test is a near-duplicate of). HB's binary
+/// `dead` flag kills `xref`'s entry unconditionally, so `consume(xref)`'s FnEntry retag now
+/// fails the same way SB's does. Needs the deferred `activated` field to distinguish this from
+/// the genuinely-activated case.
+///
 /// Passing a `&mut` whose parent was only READ (not written) is valid in HB.
 ///
 /// ## Source

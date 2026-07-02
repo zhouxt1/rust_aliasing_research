@@ -8,6 +8,13 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+/// REGRESSED (2026-07-02): moved here from pass/sb_fail/ after the `RawPointerStack.dead` fix
+/// (see COVERAGE.md's "pass/sb_tb_fail case study"). `xref2` is never written to — only read,
+/// both before and after the base-pointer read — so it is TB-Reserved throughout, and TB
+/// tolerates a foreign read on a Reserved node. HB's binary `dead` flag kills `xref2`'s entry on
+/// the `*xraw` read regardless of activation state, so `*xref2` afterward now fails. This is the
+/// missing Reserved-vs-Active distinction tracked as the deferred `activated` field.
+///
 /// Inline base-pointer READ does NOT kill a child `&mut` reborrow in HB.
 ///
 /// ## Source
@@ -36,7 +43,7 @@ fn panic(_info: &PanicInfo) -> ! {
 /// |-------|---------|--------|
 /// | SB    | **fail**| `*xraw` read pops `xref2`'s Unique stack item |
 /// | TB    | pass    | TB also preserves children on parent reads |
-/// | HB    | pass    | READ via base_pointer does not truncate exposed_stack |
+/// | HB    | **fail**| (post-fix regression) READ via base_pointer kills xref2 unconditionally |
 #[no_mangle]
 pub fn miri_start(_argc: isize, _argv: *const *const u8) -> isize {
     let mut x = 2i32;

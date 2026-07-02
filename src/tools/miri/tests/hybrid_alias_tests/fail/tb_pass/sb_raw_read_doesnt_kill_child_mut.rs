@@ -8,6 +8,13 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+/// REGRESSED (2026-07-02): moved here from pass/sb_fail/ after the `RawPointerStack.dead` fix
+/// (see COVERAGE.md's "pass/sb_tb_fail case study"). `xref` is never written to — only read, at
+/// the very end — so it is TB-Reserved throughout and TB tolerates the callee's foreign read.
+/// HB's binary `dead` flag kills `xref`'s entry unconditionally on the callee's `*xraw`, so the
+/// final `*xref` now fails. This is the same missing Reserved-vs-Active distinction (tracked as
+/// the deferred `activated` field) seen across this whole batch of regressed tests.
+///
 /// A callee reading via the parent raw pointer does NOT kill a child `&mut` in HB.
 ///
 /// ## Source
@@ -36,11 +43,11 @@ fn panic(_info: &PanicInfo) -> ! {
 /// reads and writes symmetrically for Unique items. After the callee reads via `xraw`,
 /// `xref`'s item is gone, so the final `*xref` read fails.
 ///
-/// ## Key HB design choice
+/// ## Key HB design choice (pre-fix; now outdated — see REGRESSED note above)
 ///
-/// HB only kills child entries when the parent performs a **write** (which reclaims the
-/// borrow). Reads via the base_pointer pass through without disturbing the exposed stack.
-/// This mirrors Tree Borrows' behaviour (see `tree_borrows/pass/sb_fails.rs`).
+/// HB used to only kill child entries when the parent performs a **write** (which reclaims
+/// the borrow), leaving reads via the base_pointer to pass through undisturbed. Post-fix, HB
+/// kills on *any* base-pointer read, which is what causes this regression.
 fn callee_reads_via_raw(xraw: *mut i32) {
     let _val = unsafe { *xraw }; // READ via base_pointer T_xraw — HB: does not kill T_xref
 }
