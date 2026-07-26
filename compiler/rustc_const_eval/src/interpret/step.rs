@@ -13,7 +13,6 @@ use rustc_middle::{bug, mir, span_bug};
 use rustc_span::source_map::Spanned;
 use rustc_target::callconv::FnAbi;
 use tracing::field::Empty;
-use tracing::span::Id;
 use tracing::{info, instrument, trace};
 
 use super::{
